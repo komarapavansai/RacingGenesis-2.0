@@ -7,12 +7,18 @@
     <meta http-equiv="Pragma" content="no-cache" />
     <meta http-equiv="Expires" content="0" />
     <meta name="theme-color" content="#070b14" />
-    <title>Racing Genesis - F1 Pro Simulator (Beta Build v7.0)</title>
-    <link rel="stylesheet" href="style.css?v=7.0" />
+    <title>Racing Genesis - F1 Pro Simulator (Beta Build v7.10)</title>
+    <link rel="stylesheet" href="style.css?v=7.10" />
   </head>
   <body>
     <!-- 3D WebGL Canvas Layer -->
     <div id="webgl-container"></div>
+    <canvas id="trackOverviewCanvas" class="track-overview-canvas" aria-hidden="true" hidden></canvas>
+    <div id="trackOverviewLegend" class="track-overview-legend" aria-label="Track guidance" hidden>
+      <span class="overview-straight">Straight</span>
+      <span class="overview-corner">Corner</span>
+      <span class="overview-braking">Braking zone</span>
+    </div>
 
     <!-- Floating Windows 11 Fluent Panel Toggle Buttons -->
     <button id="btnToggleLeft" class="win11-tab-toggle left" title="Toggle Track Editor Panel ([)">
@@ -41,15 +47,11 @@
           <div class="camera-switcher win11-segmented">
             <button class="cam-btn active" data-cam="chase">3rd Person</button>
             <button class="cam-btn" data-cam="hood">Cockpit 3D</button>
-            <button class="cam-btn" data-cam="orbit">Top / Orbit</button>
+            <button class="cam-btn" data-cam="aerial" title="Helicopter camera, full circuit, and map">Top / Orbit</button>
           </div>
         </div>
 
         <div class="header-right">
-          <div class="pill-stat gap-stat" id="opponentGapPill" title="Delta to Sparring Car">
-            <span class="stat-name">P2 GAP</span>
-            <span class="stat-val highlight" id="opponentGapDisplay">+1.45s</span>
-          </div>
           <div class="pill-stat fps-stat">
             <span class="stat-name">PERF</span>
             <span class="stat-val highlight" id="fpsDisplay">90 FPS</span>
@@ -71,9 +73,10 @@
 
           <!-- 5 F1 Circuit Presets -->
           <div class="f1-presets-section">
-            <span class="f1-presets-title">F1 CIRCUIT PRESETS</span>
+            <span class="f1-presets-title">CIRCUIT PRESETS</span>
             <div class="f1-presets-grid" id="f1PresetContainer">
-              <button class="f1-preset-pill active" data-preset="monza">Monza</button>
+              <button class="f1-preset-pill active" data-preset="workshop">Workshop</button>
+              <button class="f1-preset-pill" data-preset="monza">Monza</button>
               <button class="f1-preset-pill" data-preset="silverstone">Silverstone</button>
               <button class="f1-preset-pill" data-preset="spa">Spa</button>
               <button class="f1-preset-pill" data-preset="monaco">Monaco</button>
@@ -92,9 +95,8 @@
 
           <!-- Beta Multi-Car & Visual FX Toggles -->
           <div class="f1-presets-section" style="margin-top: 10px;">
-            <span class="f1-presets-title">BETA SIMULATION MODULES</span>
+            <span class="f1-presets-title">VISUAL EFFECTS</span>
             <div class="f1-presets-grid">
-              <button class="f1-preset-pill active" id="btnToggleOpponent">🏎️ AI Sparring Car: ON</button>
               <button class="f1-preset-pill active" id="btnToggleFX">💨 Smoke &amp; FX: ON</button>
             </div>
           </div>
@@ -102,12 +104,12 @@
           <div class="slider-group">
             <div class="slider-label">
               <span>Track Length (1,000m - 10,000m)</span>
-              <output id="scaleOut">5,000 m</output>
+              <output id="scaleOut">5,200 m</output>
             </div>
             <div class="track-length-row">
-              <input id="scaleSlider" type="range" min="1000" max="10000" step="50" value="5000" />
+              <input id="scaleSlider" type="range" min="1000" max="10000" step="50" value="5200" />
               <div class="length-input-wrap">
-                <input id="lengthInput" type="number" min="1000" max="10000" step="50" value="5000" />
+                <input id="lengthInput" type="number" min="1000" max="10000" step="50" value="5200" />
                 <span class="length-unit-tag">m</span>
               </div>
             </div>
@@ -177,6 +179,15 @@
 
         <!-- Center: Dynamic Driver HUD Overlay -->
         <div class="center-hud">
+          <div id="aerialControls" class="aerial-controls" role="group" aria-label="Aerial camera" hidden>
+            <button id="btnAerialFollow" type="button" aria-pressed="true" title="Follow the car with a stabilized aerial camera">Helicopter</button>
+            <button id="btnAerialCircuit" type="button" aria-pressed="false" title="See the entire track from directly overhead. Zoom in to follow the car.">Full circuit</button>
+            <button id="btnAerialMap" type="button" aria-pressed="false" title="Show the circuit map and braking guidance">Map</button>
+          </div>
+          <div id="resumeCountdown" class="resume-countdown" role="status" aria-atomic="true" hidden>
+            <span>Resuming race</span>
+            <strong id="resumeSeconds">3</strong>
+          </div>
           <!-- Official F1 5-Light Starting Gantry HUD Overlay -->
           <div class="f1-start-lights-overlay" id="f1StartLightsOverlay">
             <div class="lights-housing">
@@ -199,7 +210,7 @@
           </div>
 
           <div class="handle-notice" id="handleNotice">
-            <span>3D EDIT MODE: Tap/hold cyan dots to drag and sculpt track &bull; Pinch to scale</span>
+            <span>3D EDIT MODE: Drag the cyan dots to reshape the track</span>
           </div>
         </div>
 
@@ -222,7 +233,7 @@
             <div class="sub-gauges">
               <div class="sub-gauge-item">
                 <span class="sub-label">TRACK LENGTH</span>
-                <span class="sub-value green" id="trackLengthDisplay">5,000 m</span>
+                <span class="sub-value green" id="trackLengthDisplay">5,200 m</span>
               </div>
               <div class="sub-gauge-item">
                 <span class="sub-label">LATERAL ACCEL</span>
@@ -270,7 +281,7 @@
             <div class="telemetry-graph-card">
               <div class="telemetry-graph-header">
                 <span class="sub-label">LIVE TELEMETRY TRACE</span>
-                <span class="graph-rate-tag">90 Hz</span>
+                <span class="graph-rate-tag">LIVE</span>
               </div>
               <canvas id="telemetryGraphCanvas" width="280" height="80"></canvas>
               <div class="graph-legend-row">
@@ -308,11 +319,18 @@
         </aside>
       </div>
 
+      <div id="circuitZoomControls" class="circuit-zoom-controls" role="group" aria-label="Full circuit zoom" aria-describedby="circuitZoomHint" hidden>
+        <span id="circuitZoomHint">Scroll or pinch to zoom</span>
+        <button id="btnCircuitZoomOut" type="button" aria-label="Zoom out" title="Zoom out">&minus;</button>
+        <button id="btnCircuitZoomIn" type="button" aria-label="Zoom in" title="Zoom in">+</button>
+        <button id="btnCircuitFit" type="button" title="Restore the full overhead view">Fit track</button>
+      </div>
+
       <!-- Bottom Playback Dock (Windows 11 Fluent Command Bar) -->
       <footer class="bottom-dock win11-dock">
         <div class="dock-actions win11-command-bar">
           <button id="btnStart" class="btn btn-primary win11-primary-btn">▶ Start</button>
-          <button id="btnPause" class="btn btn-secondary win11-btn">⏸ Pause</button>
+          <button id="btnPause" disabled class="btn btn-secondary win11-btn">⏸ Pause</button>
           <button id="btnReset" class="btn btn-secondary win11-btn">🔄 Reset</button>
           <button id="btnAudio" class="btn btn-outline win11-btn">🔊 Audio: OFF</button>
         </div>
@@ -334,12 +352,12 @@
          ====================================================================== -->
 
     <!-- 1. Pause State: In-Race Pause Modal (Triggered via Esc key or Pause button) -->
-    <div id="pauseModal" class="game-modal-backdrop">
+    <dialog id="pauseModal" class="race-dialog" aria-labelledby="pauseTitle">
       <div class="game-modal-card win11-glass-panel pause-card">
         <div class="modal-header">
           <div class="brand-pill amber">SIMULATION PAUSED</div>
-          <h2>⏸️ RACE PAUSED</h2>
-          <p class="subtitle">Press <b>Esc</b> or click Resume to continue</p>
+          <h2 id="pauseTitle">⏸️ RACE PAUSED</h2>
+          <p class="subtitle">Press <b>Esc</b> or click Resume Race to start the 3-second countdown.</p>
         </div>
 
         <div class="modal-body pause-body">
@@ -347,24 +365,24 @@
             <div class="ctrl-row"><span>Accelerate / Brake:</span> <b>W / S or Up / Down</b></div>
             <div class="ctrl-row"><span>Steer Left / Right:</span> <b>A / D or Left / Right</b></div>
             <div class="ctrl-row"><span>Driver Mode:</span> <b>AI Autopilot / Manual (Toggle in Header)</b></div>
-            <div class="ctrl-row"><span>Camera Toggle:</span> <b>C Key (Cockpit &harr; Chase)</b></div>
+            <div class="ctrl-row"><span>Camera Toggle:</span> <b>C Key (Chase &rarr; Cockpit &rarr; Orbit)</b></div>
             <div class="ctrl-row"><span>Audio Toggle:</span> <b>M Key</b></div>
           </div>
         </div>
 
         <div class="modal-footer pause-footer">
-          <button id="btnResumeRace" class="btn-hero-launch win11-primary-btn">▶ Resume Race</button>
-          <button id="btnRestartRace" class="btn-hero-sandbox win11-btn">🔄 Restart Session</button>
+          <button id="btnResumeRace" class="btn-hero-launch win11-primary-btn" autofocus>▶ Resume Race</button>
+          <button id="btnRestartRace" class="btn-hero-sandbox win11-btn">Restart from grid</button>
         </div>
       </div>
-    </div>
+    </dialog>
 
     <!-- 2. End State: Session Complete / Checkered Flag Screen -->
-    <div id="finishModal" class="game-modal-backdrop">
+    <dialog id="finishModal" class="race-dialog" aria-labelledby="finishTitle">
       <div class="game-modal-card win11-glass-panel finish-card">
         <div class="modal-header">
           <div class="brand-pill green">SESSION COMPLETE</div>
-          <h2>🏁 CHECKERED FLAG!</h2>
+          <h2 id="finishTitle">🏁 CHECKERED FLAG!</h2>
           <p class="subtitle" id="finishSubTitle">Race Finished &bull; Telemetry Summary</p>
         </div>
 
@@ -414,9 +432,9 @@
           <button id="btnFinishSandbox" class="btn-hero-sandbox win11-btn">📐 Track Sculptor Sandbox</button>
         </div>
       </div>
-    </div>
+    </dialog>
 
     <!-- Application Script (ES Module with cache-busting) -->
-    <script type="module" src="app.js?v=7.0"></script>
+    <script type="module" src="app.js?v=7.10"></script>
   </body>
 </html>

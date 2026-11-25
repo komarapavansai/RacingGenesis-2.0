@@ -1,3 +1,5 @@
+> Current implementation and validation: see [prototype/README.md](prototype/README.md). The current build features a single car, revised circuits, and a Top/Orbit view with driving guidance. The assignment overview below documents the original beta submission.
+
 # Published Link : https://vshaunak.github.io/RacingGenesis-2.0/prototype/index.html
 # Racing Genesis — Assignment 5: Beta Build & Advanced Feature Integration
 

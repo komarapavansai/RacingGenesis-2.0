@@ -14,11 +14,35 @@
  */
 
 import * as THREE from "./three.module.js";
+import { CIRCUIT_LAYOUTS } from "./circuit-layouts.js";
+import { TrackOverview } from "./track-overview.js";
+import { TrackCrowd } from "./track-crowd.js";
+import { sculptBody, shapeAerofoil, shapePanel, shapeSlick } from "./race-car-geometry.js";
+
+// Dispose an owned subtree once per resource, including nested meshes and textures.
+function disposeGroupContents(group, ownedMaterials = []) {
+  const geometries = new Set(), materials = new Set(ownedMaterials.filter(Boolean)), textures = new Set();
+  group.traverse(object => {
+    if (object.isInstancedMesh) object.dispose();
+    if (object.geometry) geometries.add(object.geometry);
+    for (const material of [].concat(object.material || [])) {
+      materials.add(material);
+      for (const value of Object.values(material)) {
+        if (value && value.isTexture) textures.add(value);
+      }
+    }
+  });
+  group.clear();
+  textures.forEach(texture => texture.dispose());
+  materials.forEach(material => material.dispose());
+  geometries.forEach(geometry => geometry.dispose());
+}
 
 // Unit conversions
 const MS_TO_MPH = 2.23694;
 const MPH_TO_MS = 1 / MS_TO_MPH;
 const G_ACCEL = 9.81;
+const PHYSICS_STEP = 1 / 120;
 
 // DOM helper
 const $ = (id) => document.getElementById(id);
@@ -55,13 +79,13 @@ function createGrassTexture() {
   canvas.height = 512;
   const ctx = canvas.getContext("2d");
 
-  ctx.fillStyle = "#26541e";
+  ctx.fillStyle = "#465b30";
   ctx.fillRect(0, 0, 512, 512);
 
   // Mowing stripes
   const stripeWidth = 64;
   for (let x = 0; x < 512; x += stripeWidth * 2) {
-    ctx.fillStyle = "#2e6624";
+  ctx.fillStyle = "#485d31";
     ctx.fillRect(x, 0, stripeWidth, 512);
   }
 
@@ -77,6 +101,7 @@ function createGrassTexture() {
   ctx.putImageData(imgData, 0, 0);
 
   const texture = new THREE.CanvasTexture(canvas);
+  texture.colorSpace = THREE.SRGBColorSpace;
   texture.wrapS = THREE.RepeatWrapping;
   texture.wrapT = THREE.RepeatWrapping;
   texture.repeat.set(36, 36);
@@ -99,32 +124,68 @@ function createSkyGradientTexture() {
   return texture;
 }
 
+function createAsphaltTexture() {
+  const size = 128;
+  const pixels = new Uint8Array(size * size * 4);
+  let seed = 71;
+  for (let i = 0; i < pixels.length; i += 4) {
+    seed = (Math.imul(1664525, seed) + 1013904223) >>> 0;
+    const grain = 52 + (seed >>> 27);
+    pixels[i] = grain;
+    pixels[i + 1] = grain + 2;
+    pixels[i + 2] = grain + 4;
+    pixels[i + 3] = 255;
+  }
+  const texture = new THREE.DataTexture(pixels, size, size);
+  texture.colorSpace = THREE.SRGBColorSpace;
+  texture.wrapS = texture.wrapT = THREE.RepeatWrapping;
+  texture.magFilter = THREE.LinearFilter;
+  texture.minFilter = THREE.LinearMipmapLinearFilter;
+  texture.generateMipmaps = true;
+  texture.anisotropy = 4;
+  texture.needsUpdate = true;
+  return texture;
+}
+
+function createCurbTexture() {
+  const canvas = document.createElement("canvas");
+  canvas.width = 64;
+  canvas.height = 4;
+  const ctx = canvas.getContext("2d");
+  ctx.fillStyle = "#cf3e3e";
+  ctx.fillRect(0, 0, 32, 4);
+  ctx.fillStyle = "#e8e6df";
+  ctx.fillRect(32, 0, 32, 4);
+  const texture = new THREE.CanvasTexture(canvas);
+  texture.colorSpace = THREE.SRGBColorSpace;
+  texture.wrapS = THREE.RepeatWrapping;
+  texture.magFilter = THREE.NearestFilter;
+  texture.anisotropy = 4;
+  return texture;
+}
+
+
+function paintChecks(ctx, x, y, width, height, cols, rows, light = "#f4f8fc", dark = "#121c29") {
+  const cellWidth = width / cols;
+  const cellHeight = height / rows;
+  for (let row = 0; row < rows; row++) {
+    for (let col = 0; col < cols; col++) {
+      ctx.fillStyle = (row + col) % 2 ? dark : light;
+      ctx.fillRect(x + col * cellWidth, y + row * cellHeight, cellWidth, cellHeight);
+    }
+  }
+}
 
 function createCheckeredFinishTexture() {
   const canvas = document.createElement("canvas");
   canvas.width = 512;
   canvas.height = 128;
   const ctx = canvas.getContext("2d");
-
-  const rows = 4;
-  const cols = 16;
-  const sqW = 512 / cols;
-  const sqH = 128 / rows;
-
-  for (let r = 0; r < rows; r++) {
-    for (let c = 0; c < cols; c++) {
-      ctx.fillStyle = (r + c) % 2 === 0 ? "#ffffff" : "#111418";
-      ctx.fillRect(c * sqW, r * sqH, sqW, sqH);
-    }
-  }
-
-  ctx.fillStyle = "#ffd200";
-  ctx.fillRect(0, 0, 512, 4);
-  ctx.fillRect(0, 124, 512, 4);
-
+  paintChecks(ctx, 0, 0, 512, 128, 12, 2);
+  ctx.fillStyle = "#62e3df";
+  ctx.fillRect(0, 60, 512, 8);
   const texture = new THREE.CanvasTexture(canvas);
-  texture.wrapS = THREE.ClampToEdgeWrapping;
-  texture.wrapT = THREE.ClampToEdgeWrapping;
+  texture.colorSpace = THREE.SRGBColorSpace;
   return texture;
 }
 
@@ -134,80 +195,40 @@ function createGantryBannerTexture() {
   canvas.height = 256;
   const ctx = canvas.getContext("2d");
 
-  ctx.fillStyle = "#0c1018";
+  const background = ctx.createLinearGradient(0, 0, 0, 256);
+  background.addColorStop(0, "#263849");
+  background.addColorStop(1, "#0b141e");
+  ctx.fillStyle = background;
   ctx.fillRect(0, 0, 1024, 256);
+  ctx.fillStyle = "#62e3df";
+  ctx.fillRect(0, 0, 1024, 8);
+  ctx.fillRect(0, 248, 1024, 8);
 
-  ctx.strokeStyle = "#0078d4";
-  ctx.lineWidth = 8;
-  ctx.strokeRect(6, 6, 1012, 244);
-
-  ctx.fillStyle = "#60cdff";
-  ctx.font = "bold 32px 'Segoe UI', sans-serif";
+  paintChecks(ctx, 36, 68, 120, 120, 4, 4);
+  paintChecks(ctx, 868, 68, 120, 120, 4, 4);
   ctx.textAlign = "center";
-  ctx.fillText("CIRCUIT DE RACING GENESIS", 512, 60);
-
-  ctx.fillStyle = "#ffffff";
-  ctx.font = "900 76px 'Segoe UI', sans-serif";
-  ctx.fillText("START / FINISH", 512, 145);
-
-  ctx.fillStyle = "#ffaa00";
-  ctx.font = "bold 28px monospace";
-  ctx.fillText("OFFICIAL FIA VERIFIED TIMING TRAP \u2022 SECTOR 1", 512, 210);
+  ctx.fillStyle = "#62e3df";
+  ctx.font = "700 35px 'Segoe UI', sans-serif";
+  ctx.fillText("RACING GENESIS", 512, 81);
+  ctx.fillStyle = "#f4f8fc";
+  ctx.font = "900 90px 'Segoe UI', sans-serif";
+  ctx.fillText("START / FINISH", 512, 187, 670);
 
   const texture = new THREE.CanvasTexture(canvas);
+  texture.colorSpace = THREE.SRGBColorSpace;
   return texture;
 }
 
 function createFinishFlagTexture() {
   const canvas = document.createElement("canvas");
-  canvas.width = 1024;
-  canvas.height = 512;
+  canvas.width = 512;
+  canvas.height = 256;
   const ctx = canvas.getContext("2d");
-
-  // Bold racing checkered background grid
-  const checkRows = 6;
-  const checkCols = 16;
-  const cW = 1024 / checkCols;
-  const cH = 512 / checkRows;
-  for (let r = 0; r < checkRows; r++) {
-    for (let c = 0; c < checkCols; c++) {
-      ctx.fillStyle = (r + c) % 2 === 0 ? "#ffffff" : "#0d1117";
-      ctx.fillRect(c * cW, r * cH, cW + 1, cH + 1);
-    }
-  }
-
-  // Central high-contrast badge banner
-  ctx.fillStyle = "rgba(10, 14, 22, 0.94)";
-  ctx.fillRect(50, 70, 924, 372);
-
-  // Vibrant gold border around central banner
-  ctx.strokeStyle = "#ffd700";
-  ctx.lineWidth = 14;
-  ctx.strokeRect(50, 70, 924, 372);
-
-  // Red racing inner accent
-  ctx.strokeStyle = "#ff1744";
-  ctx.lineWidth = 5;
-  ctx.strokeRect(66, 86, 892, 340);
-
-  // Huge bold "FINISH" text
-  ctx.fillStyle = "rgba(0,0,0,0.85)";
-  ctx.font = "900 132px 'Segoe UI', Arial Black, sans-serif";
-  ctx.textAlign = "center";
-  ctx.textBaseline = "middle";
-  ctx.fillText("FINISH", 512 + 6, 238 + 6);
-
-  ctx.fillStyle = "#ffffff";
-  ctx.fillText("FINISH", 512, 238);
-
-  // Checkered icon & subtext
-  ctx.fillStyle = "#ffd700";
-  ctx.font = "bold 42px 'Segoe UI', sans-serif";
-  ctx.fillText("🏁  FINAL SECTOR  🏁", 512, 356);
-
+  paintChecks(ctx, 0, 0, 512, 256, 8, 4);
+  ctx.fillStyle = "#62e3df";
+  ctx.fillRect(0, 0, 8, 256);
   const texture = new THREE.CanvasTexture(canvas);
-  texture.wrapS = THREE.ClampToEdgeWrapping;
-  texture.wrapT = THREE.ClampToEdgeWrapping;
+  texture.colorSpace = THREE.SRGBColorSpace;
   return texture;
 }
 
@@ -263,7 +284,8 @@ class Track3D {
     this.scene = scene;
     this.app = null;
     this.activePathOffsets = null;
-    this.targetLength = 5000; // Track length in numbers from 1000m to 10000m
+    this.layoutKey = "workshop";
+    this.targetLength = CIRCUIT_LAYOUTS.workshop.length;
     this.lengthScale = this.targetLength / 520;
     this.roadWidth = 12.0;
     this.curveStrength = 0.45;
@@ -271,7 +293,6 @@ class Track3D {
     this.samples = [];
 
     // Control anchor points
-    this.controlAnchorCount = 10;
     this.controlPoints = [];
     this.handleObjects = [];
     this.handleMeshes = [];
@@ -310,7 +331,7 @@ class Track3D {
     cx /= n;
     cz /= n;
 
-    const tempCurve = new THREE.CatmullRomCurve3(this.controlPoints, true, "centripetal", 0.5);
+    const tempCurve = this.createCurve();
     const rawLen = tempCurve.getLength() || 520;
     const factor = targetMeters / rawLen;
 
@@ -333,141 +354,30 @@ class Track3D {
     return Math.sqrt(maxR2);
   }
 
-  initControlPoints() {
-    this.controlPoints = [];
-    const baseRx = 88 * this.lengthScale;
-    const baseRz = 48 * this.lengthScale;
-
-    for (let i = 0; i < this.controlAnchorCount; i++) {
-      const angle = (i / this.controlAnchorCount) * Math.PI * 2;
-      const warp = Math.sin(angle * 2) * 0.22 * this.curveStrength;
-      const x = Math.cos(angle) * baseRx * (1 + warp);
-      const z = Math.sin(angle) * baseRz + Math.cos(angle * 2) * baseRz * 0.2 * this.curveStrength;
-      this.controlPoints.push(new THREE.Vector3(x, 0.05, z));
-    }
+  createCurve() {
+    const curve = new THREE.CatmullRomCurve3(this.controlPoints, true, "centripetal");
+    curve.arcLengthDivisions = Math.max(1200, this.controlPoints.length * 48);
+    return curve;
   }
 
-  setParameters(scale, width, curve) {
-    this.lengthScale = scale;
-    this.roadWidth = width;
-    this.curveStrength = curve;
-    this.initControlPoints();
-    this.updateAllHandleVisuals();
-    this.rebuildTrackFromPoints();
+  initControlPoints(randomize = false) {
+    const { anchors } = CIRCUIT_LAYOUTS[this.layoutKey];
+    const variation = (this.curveStrength - 0.45) * 6;
+    const mirror = randomize && Math.random() < 0.5 ? -1 : 1;
+    this.controlPoints = anchors.map(([x, z], i) => {
+      // Keep the start straight stable and shape the remaining turns.
+      const bend = i < 3 ? 0 : variation * Math.sin(i * 1.7);
+      const jitter = randomize && i >= 3 ? (Math.random() - 0.5) * 5 : 0;
+      return new THREE.Vector3(x, 0.05, (z + bend + jitter) * mirror);
+    });
   }
 
   loadF1Preset(presetKey) {
-    const presets = {
-      monza: {
-        name: "Monza (Temple of Speed)",
-        points: [
-          new THREE.Vector3(-60, 0.05, 55),
-          new THREE.Vector3(-10, 0.05, 55),
-          new THREE.Vector3(45, 0.05, 55),
-          new THREE.Vector3(80, 0.05, 48),
-          new THREE.Vector3(95, 0.05, 20),
-          new THREE.Vector3(90, 0.05, -20),
-          new THREE.Vector3(65, 0.05, -42),
-          new THREE.Vector3(25, 0.05, -58),
-          new THREE.Vector3(-25, 0.05, -60),
-          new THREE.Vector3(-65, 0.05, -50),
-          new THREE.Vector3(-92, 0.05, -20),
-          new THREE.Vector3(-92, 0.05, 22),
-          new THREE.Vector3(-75, 0.05, 48),
-        ],
-      },
-      silverstone: {
-        name: "Silverstone (British GP)",
-        points: [
-          new THREE.Vector3(-55, 0.05, 50),
-          new THREE.Vector3(-10, 0.05, 52),
-          new THREE.Vector3(38, 0.05, 48),
-          new THREE.Vector3(68, 0.05, 35),
-          new THREE.Vector3(82, 0.05, 10),
-          new THREE.Vector3(66, 0.05, -12),
-          new THREE.Vector3(50, 0.05, -28),
-          new THREE.Vector3(70, 0.05, -50),
-          new THREE.Vector3(40, 0.05, -62),
-          new THREE.Vector3(-15, 0.05, -60),
-          new THREE.Vector3(-65, 0.05, -45),
-          new THREE.Vector3(-85, 0.05, -15),
-          new THREE.Vector3(-80, 0.05, 25),
-        ],
-      },
-      spa: {
-        name: "Spa-Francorchamps (Ardennes)",
-        points: [
-          new THREE.Vector3(-50, 0.05, 52),
-          new THREE.Vector3(-5, 0.05, 52),
-          new THREE.Vector3(35, 0.05, 52),
-          new THREE.Vector3(60, 0.05, 46),
-          new THREE.Vector3(85, 0.05, 30),
-          new THREE.Vector3(95, 0.05, -5),
-          new THREE.Vector3(75, 0.05, -35),
-          new THREE.Vector3(45, 0.05, -55),
-          new THREE.Vector3(-5, 0.05, -62),
-          new THREE.Vector3(-55, 0.05, -52),
-          new THREE.Vector3(-88, 0.05, -25),
-          new THREE.Vector3(-95, 0.05, 10),
-          new THREE.Vector3(-78, 0.05, 38),
-        ],
-      },
-      monaco: {
-        name: "Monaco (Monte Carlo)",
-        points: [
-          new THREE.Vector3(-45, 0.05, 45),
-          new THREE.Vector3(-5, 0.05, 48),
-          new THREE.Vector3(35, 0.05, 46),
-          new THREE.Vector3(65, 0.05, 38),
-          new THREE.Vector3(78, 0.05, 18),
-          new THREE.Vector3(60, 0.05, 2),
-          new THREE.Vector3(72, 0.05, -16),
-          new THREE.Vector3(56, 0.05, -36),
-          new THREE.Vector3(18, 0.05, -48),
-          new THREE.Vector3(-25, 0.05, -52),
-          new THREE.Vector3(-58, 0.05, -36),
-          new THREE.Vector3(-72, 0.05, -12),
-          new THREE.Vector3(-62, 0.05, 15),
-          new THREE.Vector3(-68, 0.05, 32),
-        ],
-      },
-      suzuka: {
-        name: "Suzuka (Japanese GP)",
-        points: [
-          new THREE.Vector3(-55, 0.05, 48),
-          new THREE.Vector3(-10, 0.05, 50),
-          new THREE.Vector3(30, 0.05, 48),
-          new THREE.Vector3(62, 0.05, 36),
-          new THREE.Vector3(78, 0.05, 14),
-          new THREE.Vector3(60, 0.05, -8),
-          new THREE.Vector3(76, 0.05, -28),
-          new THREE.Vector3(50, 0.05, -48),
-          new THREE.Vector3(8, 0.05, -58),
-          new THREE.Vector3(-38, 0.05, -52),
-          new THREE.Vector3(-72, 0.05, -36),
-          new THREE.Vector3(-88, 0.05, -10),
-          new THREE.Vector3(-76, 0.05, 20),
-        ],
-      },
-    };
-
-    const presetLengths = {
-      monza: 5793,
-      silverstone: 5891,
-      spa: 7004,
-      monaco: 3337,
-      suzuka: 5807,
-    };
-    const targetMeters = presetLengths[presetKey] || 5000;
-    this.targetLength = targetMeters;
-    this.lengthScale = targetMeters / 520;
-
-    const preset = presets[presetKey] || presets.monza;
-    this.controlPoints = preset.points.map(
-      (p) => new THREE.Vector3(p.x, 0.05, p.z)
-    );
-    this.controlAnchorCount = this.controlPoints.length;
+    if (!Object.hasOwn(CIRCUIT_LAYOUTS, presetKey)) return;
+    this.layoutKey = presetKey;
+    this.initControlPoints();
     this.build3DHandles();
+    const targetMeters = CIRCUIT_LAYOUTS[presetKey].length;
     this.scaleTrackToTargetLength(targetMeters);
 
     // Sync UI elements to preset length
@@ -490,24 +400,15 @@ class Track3D {
     $("curveSlider").value = this.curveStrength.toFixed(2);
     $("curveOut").value = this.curveStrength.toFixed(2);
 
-    const baseRx = 88 * this.lengthScale;
-    const baseRz = 48 * this.lengthScale;
-    this.controlPoints = [];
-    for (let i = 0; i < this.controlAnchorCount; i++) {
-      const angle = (i / this.controlAnchorCount) * Math.PI * 2;
-      const radialJitter = 1.0 + (Math.random() - 0.5) * 0.5 * this.curveStrength;
-      const warp = Math.sin(angle * 2) * 0.25 * this.curveStrength;
-      const x = Math.cos(angle) * baseRx * radialJitter * (1 + warp);
-      const z = Math.sin(angle) * baseRz * radialJitter + Math.cos(angle * 2) * baseRz * 0.22 * this.curveStrength;
-      this.controlPoints.push(new THREE.Vector3(x, 0.05, z));
-    }
-    this.updateAllHandleVisuals();
-    this.rebuildTrackFromPoints();
+    const layouts = Object.keys(CIRCUIT_LAYOUTS).filter(key => key !== this.layoutKey);
+    this.layoutKey = layouts[Math.floor(Math.random() * layouts.length)];
+    this.initControlPoints(true);
+    this.build3DHandles();
+    this.scaleTrackToTargetLength(this.targetLength);
   }
 
   setStressGeometry(dense) {
     this.denseStressMode = dense;
-    this.sampleCount = dense ? 720 : 360;
     this.rebuildTrackFromPoints();
   }
 
@@ -518,15 +419,16 @@ class Track3D {
     const baseRx = 88 * this.lengthScale;
     const baseRz = 48 * this.lengthScale;
     this.controlPoints = [];
-    for (let i = 0; i < this.controlAnchorCount; i++) {
-      const angle = (i / this.controlAnchorCount) * Math.PI * 2;
+    const anchorCount = 13;
+    for (let i = 0; i < anchorCount; i++) {
+      const angle = (i / anchorCount) * Math.PI * 2;
       const zigzag = i % 2 === 0 ? 1.35 : 0.65;
       const x = Math.cos(angle) * baseRx * zigzag;
       const z = Math.sin(angle) * baseRz * (i % 3 === 0 ? 1.4 : 0.7);
       this.controlPoints.push(new THREE.Vector3(x, 0.05, z));
     }
-    this.updateAllHandleVisuals();
-    this.rebuildTrackFromPoints();
+    this.build3DHandles();
+    this.scaleTrackToTargetLength(this.targetLength);
   }
 
   toggleEditHandles() {
@@ -608,19 +510,14 @@ class Track3D {
   }
 
   build3DHandles() {
-    while (this.handleGroup.children.length > 0) {
-      const child = this.handleGroup.children[0];
-      this.handleGroup.remove(child);
-      if (child.geometry) child.geometry.dispose();
-      if (child.material) child.material.dispose();
-    }
+    disposeGroupContents(this.handleGroup);
     this.handleObjects = [];
     this.handleMeshes = [];
 
     const sphereGeom = new THREE.SphereGeometry(0.55, 24, 24);
     const ringGeom = new THREE.RingGeometry(0.65, 0.95, 32);
 
-    for (let i = 0; i < this.controlAnchorCount; i++) {
+    for (let i = 0; i < this.controlPoints.length; i++) {
       const p = this.controlPoints[i];
 
       const sphereMat = new THREE.MeshStandardMaterial({
@@ -701,28 +598,21 @@ class Track3D {
       const h = this.handleObjects[i];
       if (!h || !h.sphere) continue;
       const dist = camPos.distanceTo(h.sphere.position);
-      const baseScale = Math.max(0.4, Math.min(2.4, dist * 0.007));
+      const baseScale = Math.max(0.4, dist * 0.007);
       const activeScale = h.userData && h.userData.hover ? 1.25 : (h.userData && h.userData.active ? 1.4 : 1.0);
       const finalScale = baseScale * activeScale;
       h.sphere.scale.setScalar(finalScale);
       h.ring.scale.setScalar(finalScale);
+      h.pickProxy.scale.setScalar(finalScale);
     }
   }
 
   rebuildTrackFromPoints() {
-    while (this.trackGroup.children.length > 0) {
-      const child = this.trackGroup.children[0];
-      this.trackGroup.remove(child);
-      if (child.geometry) child.geometry.dispose();
-      if (child.material) {
-        if (Array.isArray(child.material)) child.material.forEach((m) => m.dispose());
-        else child.material.dispose();
-      }
-    }
-
-    this.curve = new THREE.CatmullRomCurve3(this.controlPoints, true, "centripetal", 0.5);
+    disposeGroupContents(this.trackGroup, [this.matLightOff, this.matLightRed, this.matLightGreen]);
+    this.activePathOffsets = null;
+    this.curve = this.createCurve();
     this.totalLength = Math.round(this.curve.getLength());
-    this.sampleCount = Math.max(360, Math.min(1000, Math.round(this.totalLength / 8)));
+    this.sampleCount = Math.max(360, Math.min(this.denseStressMode ? 2000 : 1000, Math.round(this.totalLength / (this.denseStressMode ? 4 : 8))));
 
     this.samples = [];
     for (let i = 0; i < this.sampleCount; i++) {
@@ -732,6 +622,7 @@ class Track3D {
       const normal = new THREE.Vector3(-tangent.z, 0, tangent.x).normalize();
 
       this.samples.push({
+        index: i,
         position: pos,
         tangent: tangent,
         normal: normal,
@@ -793,6 +684,7 @@ class Track3D {
 
     this.buildRoadMesh();
     this.buildCurbs();
+    this.buildGrassVerges();
     this.buildGravelTraps();
     this.buildGuardRails();
     this.buildStartGantry();
@@ -840,7 +732,7 @@ class Track3D {
   }
 
   getPathCurvature(progress) {
-    const d = 0.015;
+    const d = Math.max(2, this.totalLength / this.sampleCount) / this.totalLength;
     this.getPathPosition(progress - d, _pPrev);
     this.getPathPosition(progress, _pCurr);
     this.getPathPosition(progress + d, _pNext);
@@ -858,7 +750,7 @@ class Track3D {
     if (lenC < 0.001) return 0.001;
 
     const kappa = (2 * crossLen) / (lenA * lenB * lenC);
-    return Math.max(0.0006, Math.min(0.2, kappa));
+    return Math.max(0, kappa);
   }
 
   getRacingLineOffset(progress) {
@@ -873,7 +765,7 @@ class Track3D {
   }
 
   getTrajectoryHeading(progress) {
-    const ds = 0.008; // Smooth ~10m baseline for stable, weighted chassis heading
+    const ds = 5 / this.totalLength; // Five-meter heading baseline on any circuit size
     this.getPathPosition(progress - ds, _hPrev);
     this.getPathPosition(progress + ds, _hNext);
     _trajectoryVec.subVectors(_hNext, _hPrev);
@@ -889,6 +781,7 @@ class Track3D {
 
   buildRoadMesh() {
     const halfW = this.roadWidth / 2;
+    const tileLength = Math.max(1, Math.round(this.totalLength / 2.5));
     const vertices = [];
     const uvs = [];
     const indices = [];
@@ -901,9 +794,9 @@ class Track3D {
       vertices.push(left.x, left.y, left.z);
       vertices.push(right.x, right.y, right.z);
 
-      const vProg = (i / this.sampleCount) * 45;
+      const vProg = (i / this.sampleCount) * tileLength;
       uvs.push(0, vProg);
-      uvs.push(1, vProg);
+      uvs.push(this.roadWidth / 2.5, vProg);
 
       if (i < this.sampleCount) {
         const base = i * 2;
@@ -919,9 +812,9 @@ class Track3D {
     geom.computeVertexNormals();
 
     const roadMat = new THREE.MeshStandardMaterial({
-      color: 0x181c22,
-      roughness: 0.82,
-      metalness: 0.12,
+      map: createAsphaltTexture(),
+      roughness: 0.94,
+      metalness: 0,
       polygonOffset: true,
       polygonOffsetFactor: -1,
       polygonOffsetUnits: -1,
@@ -931,31 +824,48 @@ class Track3D {
     this.roadMesh.receiveShadow = true;
     this.trackGroup.add(this.roadMesh);
 
-    // Subtle edge asphalt lines
-    [-1, 1].forEach((offsetSide) => {
-      const lineGeom = new THREE.BufferGeometry();
-      const linePts = [];
+    // Paint the edges at their physical width so they don't shimmer as screen-space lines.
+    const paintVertices = [], paintIndices = [];
+    for (const side of [-1, 1]) {
+      const first = paintVertices.length / 3;
       for (let i = 0; i <= this.sampleCount; i++) {
-        const s = this.samples[i % this.sampleCount];
-        const pt = s.position.clone().addScaledVector(s.normal, offsetSide * (halfW - 0.3));
-        linePts.push(pt.x, pt.y + 0.02, pt.z);
+        const { position, normal } = this.samples[i % this.sampleCount];
+        for (const width of [halfW - 0.47, halfW - 0.25]) {
+          paintVertices.push(position.x + normal.x * width * side, position.y + 0.018, position.z + normal.z * width * side);
+        }
+        if (i === this.sampleCount) continue;
+        const a = first + i * 2;
+        if (side > 0) paintIndices.push(a, a + 1, a + 2, a + 1, a + 3, a + 2);
+        else paintIndices.push(a, a + 2, a + 1, a + 1, a + 2, a + 3);
       }
-      lineGeom.setAttribute("position", new THREE.Float32BufferAttribute(linePts, 3));
-      const lineMat = new THREE.LineBasicMaterial({ color: 0xffffff, transparent: true, opacity: 0.65 });
-      const edgeLine = new THREE.Line(lineGeom, lineMat);
-      this.trackGroup.add(edgeLine);
-    });
+    }
+    const paintGeometry = new THREE.BufferGeometry();
+    paintGeometry.setAttribute("position", new THREE.Float32BufferAttribute(paintVertices, 3));
+    paintGeometry.setIndex(paintIndices);
+    paintGeometry.computeVertexNormals();
+    const paint = new THREE.Mesh(paintGeometry, new THREE.MeshStandardMaterial({ color: 0xdfded3, roughness: 0.96 }));
+    paint.name = "Track edge paint";
+    paint.receiveShadow = true;
+    this.trackGroup.add(paint);
   }
 
   buildCurbs() {
     const halfW = this.roadWidth / 2;
     const curbW = 1.35;
     const curbH = 0.16;
+    const stripePairs = Math.max(1, Math.round(this.totalLength / 8));
+    const material = new THREE.MeshStandardMaterial({
+      map: createCurbTexture(),
+      roughness: 0.82,
+      polygonOffset: true,
+      polygonOffsetFactor: -2,
+      polygonOffsetUnits: -2,
+    });
 
     const buildCurbStrip = (side) => {
       const geom = new THREE.BufferGeometry();
       const vertices = [];
-      const colors = [];
+      const uvs = [];
       const indices = [];
 
       for (let i = 0; i <= this.sampleCount; i++) {
@@ -969,31 +879,25 @@ class Track3D {
         vertices.push(inner.x, inner.y, inner.z);
         vertices.push(outer.x, outer.y, outer.z);
 
-        const isRed = Math.floor(i / 3) % 2 === 0;
-        colors.push(isRed ? 0.95 : 0.95, isRed ? 0.12 : 0.95, isRed ? 0.18 : 0.95);
-        colors.push(isRed ? 0.95 : 0.95, isRed ? 0.12 : 0.95, isRed ? 0.18 : 0.95);
+        const u = i / this.sampleCount * stripePairs;
+        uvs.push(u, 0, u, 1);
 
         if (i < this.sampleCount) {
           const base = i * 2;
-          indices.push(base, base + 1, base + 2);
-          indices.push(base + 1, base + 3, base + 2);
+          if (side > 0) {
+            indices.push(base, base + 1, base + 2, base + 1, base + 3, base + 2);
+          } else {
+            indices.push(base, base + 2, base + 1, base + 1, base + 2, base + 3);
+          }
         }
       }
 
       geom.setAttribute("position", new THREE.Float32BufferAttribute(vertices, 3));
-      geom.setAttribute("color", new THREE.Float32BufferAttribute(colors, 3));
+      geom.setAttribute("uv", new THREE.Float32BufferAttribute(uvs, 2));
       geom.setIndex(indices);
       geom.computeVertexNormals();
 
-      const mat = new THREE.MeshStandardMaterial({
-        vertexColors: true,
-        roughness: 0.55,
-        metalness: 0.05,
-        polygonOffset: true,
-        polygonOffsetFactor: -2,
-        polygonOffsetUnits: -2,
-      });
-      const mesh = new THREE.Mesh(geom, mat);
+      const mesh = new THREE.Mesh(geom, material);
       mesh.receiveShadow = true;
       this.trackGroup.add(mesh);
     };
@@ -1002,27 +906,74 @@ class Track3D {
     buildCurbStrip(1);
   }
 
-  buildGravelTraps() {
-    const halfW = this.roadWidth / 2 + 1.4;
-    const trapW = 6.5;
-
-    for (let i = 0; i < this.sampleCount; i += 6) {
-      const s = this.samples[i];
-      if (s.curvature > 0.007) {
-        const outsideSide = -Math.sign(s.signedCurvature) || 1;
-        const center = s.position.clone().addScaledVector(s.normal, outsideSide * (halfW + trapW / 2));
-        center.y = 0.03;
-
-        const trapGeom = new THREE.PlaneGeometry(trapW, 10);
-        const trapMat = new THREE.MeshStandardMaterial({ color: 0xc8a876, roughness: 0.95, metalness: 0.05 });
-        const trap = new THREE.Mesh(trapGeom, trapMat);
-        trap.rotation.x = -Math.PI / 2;
-        trap.rotation.z = Math.atan2(s.tangent.x, s.tangent.z);
-        trap.position.copy(center);
-        trap.receiveShadow = true;
-        this.trackGroup.add(trap);
+  buildGrassVerges() {
+    const colors = [0x70724b, 0x6c7045, 0x59683b, 0x4e5e31, 0x5a6b3c, 0x4a5a30, 0x526337, 0x465b30]
+      .map(hex => new THREE.Color(hex));
+    const widths = [0, 1.1, 2.5, 4.2, 6.8, 9.1, 12.7, 17];
+    const edge = this.roadWidth / 2 + 1.35;
+    const vertices = [], vertexColors = [], indices = [];
+    for (const side of [-1, 1]) {
+      const first = vertices.length / 3;
+      for (let i = 0; i <= this.sampleCount; i++) {
+        const { position, normal, signedCurvature } = this.samples[i % this.sampleCount];
+        const phase = 2 * Math.PI * i / this.sampleCount;
+        const spread = 1 + Math.sin(phase * 9 + side) * 0.12 + Math.sin(phase * 17) * 0.07;
+        const insideLimit = signedCurvature * side > 0 ? Math.max(0.4, 0.8 / Math.abs(signedCurvature) - edge) : Infinity;
+        const scale = Math.min(spread, insideLimit / widths.at(-1));
+        for (let j = 0; j < widths.length; j++) {
+          const offset = side * (edge + widths[j] * scale);
+          vertices.push(position.x + normal.x * offset, 0.014, position.z + normal.z * offset);
+          const color = colors[j];
+          vertexColors.push(color.r, color.g, color.b, j === widths.length - 1 ? 0 : 1);
+          if (i === this.sampleCount || j === widths.length - 1) continue;
+          const a = first + i * widths.length + j;
+          const b = a + 1, c = a + widths.length, d = c + 1;
+          if (side > 0) indices.push(a, b, c, b, d, c);
+          else indices.push(a, c, b, b, c, d);
+        }
       }
     }
+    const geometry = new THREE.BufferGeometry();
+    geometry.setAttribute("position", new THREE.Float32BufferAttribute(vertices, 3));
+    geometry.setAttribute("color", new THREE.Float32BufferAttribute(vertexColors, 4));
+    geometry.setIndex(indices);
+    geometry.computeVertexNormals();
+    const material = new THREE.MeshStandardMaterial({ vertexColors: true, transparent: true, depthWrite: false, roughness: 1 });
+    const verge = new THREE.Mesh(geometry, material);
+    verge.name = "Mown grass verges";
+    verge.receiveShadow = true;
+    this.trackGroup.add(verge);
+  }
+
+  buildGravelTraps() {
+    const edge = this.roadWidth / 2 + 1.35;
+    const vertices = [], indices = [];
+    for (const side of [-1, 1]) {
+      const start = vertices.length / 3;
+      const widths = this.samples.map(s => 6.5 * THREE.MathUtils.smoothstep(-side * s.signedCurvature, 0.004, 0.013));
+      for (let i = 0; i <= this.sampleCount; i++) {
+        const index = i % this.sampleCount;
+        const { position, normal } = this.samples[index];
+        for (const distance of [edge, edge + widths[index]]) {
+          const offset = side * distance;
+          vertices.push(position.x + normal.x * offset, position.y - 0.02, position.z + normal.z * offset);
+        }
+        if (i === this.sampleCount || widths[index] + widths[(i + 1) % this.sampleCount] === 0) continue;
+        const a = start + i * 2;
+        if (side > 0) indices.push(a, a + 1, a + 2, a + 1, a + 3, a + 2);
+        else indices.push(a, a + 2, a + 1, a + 1, a + 2, a + 3);
+      }
+    }
+    if (!indices.length) return;
+    const geometry = new THREE.BufferGeometry();
+    geometry.setAttribute("position", new THREE.Float32BufferAttribute(vertices, 3));
+    geometry.setIndex(indices);
+    geometry.computeVertexNormals();
+    const material = new THREE.MeshStandardMaterial({ color: 0xb79a73, roughness: 0.95 });
+    const gravel = new THREE.Mesh(geometry, material);
+    gravel.name = "Gravel runoff";
+    gravel.receiveShadow = true;
+    this.trackGroup.add(gravel);
   }
 
   buildGuardRails() {
@@ -1030,86 +981,82 @@ class Track3D {
     const postMat = new THREE.MeshStandardMaterial({ color: 0x4a5568, metalness: 0.75, roughness: 0.35 });
     const railMat = new THREE.MeshStandardMaterial({ color: 0x8a9ba8, metalness: 0.85, roughness: 0.25 });
     const step = this.denseStressMode ? 2 : 4;
-
-    for (let i = 0; i < this.sampleCount; i += step) {
-      const s = this.samples[i];
-      if (s.curvature > 0.004 || this.denseStressMode) {
-        [-1, 1].forEach((side) => {
-          const postPos = s.position.clone().addScaledVector(s.normal, side * halfW);
-          const postGeom = new THREE.BoxGeometry(0.22, 1.3, 0.22);
-          const post = new THREE.Mesh(postGeom, postMat);
-          post.position.copy(postPos);
-          post.position.y += 0.65;
-          post.castShadow = true;
-          this.trackGroup.add(post);
-
-          const railGeom = new THREE.BoxGeometry(0.08, 0.45, 5.0);
-          const rail = new THREE.Mesh(railGeom, railMat);
-          rail.position.copy(postPos);
-          rail.position.y += 0.7;
-          rail.rotation.y = Math.atan2(s.tangent.x, s.tangent.z);
-          this.trackGroup.add(rail);
-        });
+    const samples = this.samples.filter((s, i) => i % step === 0 && (s.curvature > 0.004 || this.denseStressMode));
+    if (!samples.length) {
+      postMat.dispose();
+      railMat.dispose();
+      return;
+    }
+    const posts = new THREE.InstancedMesh(new THREE.BoxGeometry(0.22, 1.3, 0.22), postMat, samples.length * 2);
+    const rails = new THREE.InstancedMesh(new THREE.BoxGeometry(0.08, 0.45, 5.0), railMat, samples.length * 2);
+    const transform = new THREE.Matrix4();
+    const position = new THREE.Vector3();
+    let index = 0;
+    for (const sample of samples) {
+      for (const side of [-1, 1]) {
+        position.copy(sample.position).addScaledVector(sample.normal, side * halfW);
+        position.y += 0.65;
+        posts.setMatrixAt(index, transform.makeTranslation(position.x, position.y, position.z));
+        position.y += 0.05;
+        transform.makeRotationY(Math.atan2(sample.tangent.x, sample.tangent.z)).setPosition(position);
+        rails.setMatrixAt(index++, transform);
       }
     }
+    posts.name = "Guardrail posts";
+    rails.name = "Guardrail panels";
+    posts.castShadow = true;
+    this.trackGroup.add(posts, rails);
   }
 
   buildStartGantry() {
     const s0 = this.samples[0];
-    const halfW = this.roadWidth / 2 + 2.8;
-
-    // Gantry Group perfectly aligned with track frame
-    // Local X runs across track (along normal); Local Z runs along track (along tangent)
     const gantryGroup = new THREE.Group();
-    gantryGroup.position.copy(s0.position);
-    gantryGroup.rotation.y = Math.atan2(s0.tangent.x, s0.tangent.z);
+    gantryGroup.name = "Start / Finish Gantry";
+    // Place the bridge just ahead of the timing line so it clears the car on the grid.
+    const bridgeProgress = 6 / this.totalLength;
+    this.curve.getPointAt(bridgeProgress, gantryGroup.position);
+    this.gantryPosition = gantryGroup.position;
+    const bridgeTangent = this.curve.getTangentAt(bridgeProgress, _scratchTangent);
+    gantryGroup.rotation.y = Math.atan2(bridgeTangent.x, bridgeTangent.z);
 
-    const metalMat = new THREE.MeshStandardMaterial({ color: 0x222a36, metalness: 0.85, roughness: 0.25 });
-    const trussMat = new THREE.MeshStandardMaterial({ color: 0x364354, metalness: 0.9, roughness: 0.2 });
+    const pillarX = this.roadWidth / 2 + 2.8;
+    const beamWidth = pillarX * 2 + 0.85;
+    const structure = new THREE.MeshStandardMaterial({ color: 0x263849, metalness: 0.25, roughness: 0.55 });
+    const baseMaterial = new THREE.MeshStandardMaterial({ color: 0xa7b5c2, roughness: 0.82 });
+    const accent = new THREE.MeshBasicMaterial({ color: 0x62e3df, toneMapped: false });
+    const signalHousing = new THREE.MeshStandardMaterial({ color: 0x121c29, roughness: 0.65 });
+    const box = (name, width, height, depth, material, x, y, z) => {
+      const mesh = new THREE.Mesh(new THREE.BoxGeometry(width, height, depth), material);
+      mesh.name = name;
+      mesh.position.set(x, y, z);
+      gantryGroup.add(mesh);
+      return mesh;
+    };
 
-    // Left and Right Pillars (Spanning horizontally across track at X = -halfW and +halfW)
-    const pillarGeom = new THREE.BoxGeometry(0.75, 8.5, 0.75);
-    const leftPillar = new THREE.Mesh(pillarGeom, metalMat);
-    leftPillar.position.set(-halfW, 4.25, 0);
-    leftPillar.castShadow = true;
-    gantryGroup.add(leftPillar);
-
-    const rightPillar = new THREE.Mesh(pillarGeom, metalMat);
-    rightPillar.position.set(halfW, 4.25, 0);
-    rightPillar.castShadow = true;
-    gantryGroup.add(rightPillar);
-
-    // Double Overhead Horizontal Beam spanning between pillars across X axis
-    const beamLength = halfW * 2 + 1.2;
-    const topBeamGeom = new THREE.BoxGeometry(beamLength, 0.85, 0.85);
-    const topBeam = new THREE.Mesh(topBeamGeom, metalMat);
-    topBeam.position.set(0, 8.1, 0);
-    gantryGroup.add(topBeam);
-
-    const lowerBeamGeom = new THREE.BoxGeometry(beamLength, 0.65, 0.65);
-    const lowerBeam = new THREE.Mesh(lowerBeamGeom, trussMat);
-    lowerBeam.position.set(0, 5.8, 0);
-    gantryGroup.add(lowerBeam);
-
-    // Diagonal truss braces
-    for (let x = -halfW + 2; x < halfW - 1; x += 3.2) {
-      const braceGeom = new THREE.CylinderGeometry(0.06, 0.06, 2.5, 8);
-      const brace = new THREE.Mesh(braceGeom, trussMat);
-      brace.position.set(x, 6.95, 0);
-      brace.rotation.z = Math.PI / 4;
-      gantryGroup.add(brace);
+    for (const side of [-1, 1]) {
+      const x = side * pillarX;
+      box("Pylon base", 1.45, 0.45, 1.45, baseMaterial, x, 0.225, 0);
+      box("Gantry pylon", 0.88, 7.15, 0.86, structure, x, 3.575, 0).castShadow = true;
+      box("Pylon accent", 0.12, 5.7, 0.04, accent, x, 3.65, -0.45);
+      box("Timing marker", 0.46, 1.1, 0.54, structure, side * (this.roadWidth / 2 + 1.7), 0.55, 0);
+      box("Timing marker lens", 0.48, 0.18, 0.56, accent, side * (this.roadWidth / 2 + 1.7), 1.06, 0);
     }
 
-    // High-Tech Digital LED Timing Billboard across the gantry
-    const bannerTex = createGantryBannerTexture();
-    const bannerMat = new THREE.MeshBasicMaterial({ map: bannerTex });
-    const bannerGeom = new THREE.BoxGeometry(Math.min(18, halfW * 1.7), 1.8, 0.2);
-    const banner = new THREE.Mesh(bannerGeom, bannerMat);
-    banner.position.set(0, 6.95, 0.15);
-    gantryGroup.add(banner);
+    box("Gantry crossbeam", beamWidth, 2.2, 0.96, structure, 0, 6.65, 0);
+    box("Upper accent", beamWidth + 0.1, 0.08, 1.02, accent, 0, 7.81, 0);
+    box("Lower rail", beamWidth + 0.1, 0.18, 1.02, baseMaterial, 0, 5.45, 0);
 
-    // Official F1 5-Light Starting Signal Pod with Dynamic Shading Materials
-    const lightBoxMat = new THREE.MeshStandardMaterial({ color: 0x0a0c10, metalness: 0.85, roughness: 0.3 });
+    const bannerMat = new THREE.MeshBasicMaterial({ map: createGantryBannerTexture(), toneMapped: false });
+    const bannerGeom = new THREE.PlaneGeometry(Math.min(beamWidth - 1.3, 12.4), 2.04);
+    for (const side of [-1, 1]) {
+      const banner = new THREE.Mesh(bannerGeom, bannerMat);
+      banner.name = side < 0 ? "Start / Finish approach sign" : "Start / Finish reverse sign";
+      banner.position.set(0, 6.65, side * 0.49);
+      banner.rotation.y = side < 0 ? Math.PI : 0;
+      gantryGroup.add(banner);
+    }
+
+    // Keep the five race signals centered below the sign and facing the grid.
     this.matLightOff = new THREE.MeshStandardMaterial({ color: 0x141820, roughness: 0.85, metalness: 0.2 });
     this.matLightRed = new THREE.MeshStandardMaterial({
       color: 0xff1744,
@@ -1124,61 +1071,53 @@ class Track3D {
       roughness: 0.1,
     });
 
-    const lightBoxGeom = new THREE.BoxGeometry(4.2, 0.7, 0.35);
-    const lightBox = new THREE.Mesh(lightBoxGeom, lightBoxMat);
-    lightBox.position.set(0, 5.2, -0.4);
-    gantryGroup.add(lightBox);
-
+    box("Start light housing", 4.28, 0.78, 0.4, signalHousing, 0, 5.04, -0.2);
     this.startLightMeshes = [];
+    const lens = new THREE.CylinderGeometry(0.14, 0.14, 0.09, 16).rotateX(Math.PI / 2);
     for (let k = -2; k <= 2; k++) {
-      const ledGeom = new THREE.CylinderGeometry(0.14, 0.14, 0.1, 16);
-      ledGeom.rotateX(Math.PI / 2);
-      const topLed = new THREE.Mesh(ledGeom, this.matLightOff);
-      topLed.position.set(k * 0.75, 5.35, -0.55);
-      gantryGroup.add(topLed);
-
-      const botLed = new THREE.Mesh(ledGeom, this.matLightOff);
-      botLed.position.set(k * 0.75, 5.05, -0.55);
-      gantryGroup.add(botLed);
-
-      this.startLightMeshes.push({ top: topLed, bot: botLed });
+      const top = new THREE.Mesh(lens, this.matLightOff);
+      const bot = new THREE.Mesh(lens, this.matLightOff);
+      top.position.set(k * 0.75, 5.19, -0.43);
+      bot.position.set(k * 0.75, 4.89, -0.43);
+      gantryGroup.add(top, bot);
+      this.startLightMeshes.push({ top, bot });
     }
 
-    // Checkered Finish Line (Fixed 100% horizontally across track width!)
-    const finishGeom = new THREE.PlaneGeometry(this.roadWidth * 0.98, 2.4);
-    const finishMat = new THREE.MeshBasicMaterial({
-      map: createCheckeredFinishTexture(),
-      side: THREE.DoubleSide,
-      transparent: true,
-      opacity: 0.96,
-      polygonOffset: true,
-      polygonOffsetFactor: -3,
-      polygonOffsetUnits: -3,
-    });
-    const finishMesh = new THREE.Mesh(finishGeom, finishMat);
-    finishMesh.rotation.x = -Math.PI / 2;
-    finishMesh.position.set(0, 0.035, 0); // Flat on track asphalt in local frame
-    gantryGroup.add(finishMesh);
+    const finish = new THREE.Mesh(
+      new THREE.PlaneGeometry(this.roadWidth, 2.1),
+      new THREE.MeshBasicMaterial({ map: createCheckeredFinishTexture(), toneMapped: false }),
+    );
+    finish.name = "Start / Finish timing stripe";
+    finish.geometry.rotateX(-Math.PI / 2);
+    finish.rotation.y = Math.atan2(s0.tangent.x, s0.tangent.z);
+    finish.position.copy(s0.position);
+    finish.position.y += 0.035;
 
-    // 6 Staggered Formula 1 Starting Grid Boxes on approach
-    const gridBoxMat = new THREE.MeshBasicMaterial({
-      color: 0xffffff,
-      transparent: true,
-      opacity: 0.85,
-      polygonOffset: true,
-      polygonOffsetFactor: -4,
-      polygonOffsetUnits: -4,
-    });
-    for (let g = 1; g <= 6; g++) {
-      const side = g % 2 === 1 ? -1 : 1;
-      const boxLineGeom = new THREE.PlaneGeometry(2.4, 0.2);
-      const boxLine = new THREE.Mesh(boxLineGeom, gridBoxMat);
-      boxLine.rotation.x = -Math.PI / 2;
-      boxLine.position.set(side * (this.roadWidth * 0.22), 0.032, -g * 7.5);
-      gantryGroup.add(boxLine);
+    const paint = new THREE.MeshBasicMaterial({ color: 0xf4f8fc, toneMapped: false });
+    const crossbar = new THREE.PlaneGeometry(2.55, 0.13).rotateX(-Math.PI / 2);
+    const sideBar = new THREE.PlaneGeometry(0.13, 2).rotateX(-Math.PI / 2);
+    const gridPositions = new THREE.Group();
+    gridPositions.name = "Starting grid";
+    for (let index = 1; index <= 6; index++) {
+      const grid = new THREE.Group();
+      const side = index % 2 ? -1 : 1;
+      const progress = 1 - index * 8 / this.totalLength;
+      const tangent = this.curve.getTangentAt(progress, _scratchTangent);
+      const normal = _scratchNormal.set(-tangent.z, 0, tangent.x).normalize();
+      this.curve.getPointAt(progress, grid.position);
+      grid.position.addScaledVector(normal, side * this.roadWidth * 0.23);
+      grid.position.y += 0.03;
+      grid.rotation.y = Math.atan2(tangent.x, tangent.z);
+      const front = new THREE.Mesh(crossbar, paint);
+      const left = new THREE.Mesh(sideBar, paint);
+      const right = new THREE.Mesh(sideBar, paint);
+      front.position.z = 1;
+      left.position.x = -1.21;
+      right.position.x = 1.21;
+      grid.add(front, left, right);
+      gridPositions.add(grid);
     }
-
-    this.trackGroup.add(gantryGroup);
+    this.trackGroup.add(gantryGroup, finish, gridPositions);
   }
 
   setGantryLights(mode, redCount = 0) {
@@ -1296,10 +1235,9 @@ class Track3D {
     finial.position.set(leftX - 0.25, 7.6, 0);
     flagGroup.add(finial);
 
-    // 4. Large Animated 3D Waving Finish Flag ("FINISH")
-    // Width 5.0m, Height 2.8m, angled facing incoming cars
-    const flagW = 5.0;
-    const flagH = 2.8;
+    // Double-sided checkered cloth remains readable from either direction.
+    const flagW = 3.8;
+    const flagH = 1.9;
     const flagGeom = new THREE.PlaneGeometry(flagW, flagH, 36, 18);
     // Anchor left edge at pole (x = 0 at pole, extends towards +X)
     flagGeom.translate(flagW / 2, 0, 0);
@@ -1319,6 +1257,7 @@ class Track3D {
 
     this.finishFlagMesh = flagMesh;
     this.flagGeom = flagGeom;
+    this.flagWidth = flagW;
     this.flagWaveTime = 0;
 
     this.trackGroup.add(flagGroup);
@@ -1337,7 +1276,7 @@ class Track3D {
     for (let i = 0; i < pos.count; i++) {
       const x = pos.getX(i);
       const y = pos.getY(i);
-      const ratio = Math.max(0, x / 5.0);
+      const ratio = Math.max(0, x / this.flagWidth);
       const wave = Math.sin(x * 2.2 - time) * ratio * waveAmp
                  + Math.cos(y * 2.8 + time * 0.75) * (ratio * ratio) * (waveAmp * 0.4);
       pos.setZ(i, wave);
@@ -1357,7 +1296,7 @@ class Track3D {
   }
 
   buildAudienceAndGrandstands() {
-    this.animatedSpectators = [];
+    this.crowd = new TrackCrowd();
 
     // Team shirt colors for diverse spectator crowd (Ultra-Vibrant)
     const teamColors = [
@@ -1371,77 +1310,20 @@ class Track3D {
       0x7c4dff, // Purple
     ];
 
-    const spectatorMats = teamColors.map(
-      (c) => new THREE.MeshStandardMaterial({ color: c, roughness: 0.6, metalness: 0.1 })
-    );
-    const skinMat = new THREE.MeshStandardMaterial({ color: 0xf5cba7, roughness: 0.8 });
-    const whiteCapMat = new THREE.MeshStandardMaterial({ color: 0xffffff, roughness: 0.4 });
-    const whiteMat = whiteCapMat;
+    const whiteMat = new THREE.MeshStandardMaterial({ color: 0xffffff, roughness: 0.4 });
     const seatMat = new THREE.MeshStandardMaterial({ color: 0x0d47a1, roughness: 0.6 });
     const canopyMat = new THREE.MeshStandardMaterial({ color: 0x1e293b, roughness: 0.5, side: THREE.DoubleSide });
     const frameMat = new THREE.MeshStandardMaterial({ color: 0x64748b, metalness: 0.85, roughness: 0.25 });
     const fenceMat = new THREE.MeshStandardMaterial({ color: 0xffffff, metalness: 0.3, roughness: 0.4 });
     const grassMoundMat = new THREE.MeshStandardMaterial({ color: 0x2e7d32, roughness: 0.95 });
 
-    const createSpectator = (isSeated = false) => {
-      const person = new THREE.Group();
-      const cIdx = Math.floor(Math.random() * spectatorMats.length);
-      const shirtMat = spectatorMats[cIdx];
-
-      // Human scale: total height ~ 1.75m
-      const bodyH = isSeated ? 0.65 : 0.78;
-      const bodyGeom = new THREE.BoxGeometry(0.46, bodyH, 0.28);
-      const body = new THREE.Mesh(bodyGeom, shirtMat);
-      body.position.y = bodyH / 2;
-      person.add(body);
-
-      // Head
-      const headGeom = new THREE.SphereGeometry(0.18, 10, 10);
-      const head = new THREE.Mesh(headGeom, skinMat);
-      head.position.y = bodyH + 0.2;
-      person.add(head);
-
-      // Cap
-      const capGeom = new THREE.CylinderGeometry(0.19, 0.19, 0.08, 10);
-      const cap = new THREE.Mesh(capGeom, Math.random() > 0.3 ? shirtMat : whiteCapMat);
-      cap.position.y = bodyH + 0.32;
-      person.add(cap);
-
-      // Waving Arm
-      const armPivot = new THREE.Group();
-      armPivot.position.set(0.26, bodyH * 0.85, 0);
-      const armGeom = new THREE.CylinderGeometry(0.065, 0.065, 0.55, 6);
-      const arm = new THREE.Mesh(armGeom, shirtMat);
-      arm.position.y = 0.28;
-      armPivot.add(arm);
-
-      // Cheering Flag in hand
-      if (Math.random() > 0.45) {
-        const flagStick = new THREE.Mesh(new THREE.CylinderGeometry(0.02, 0.02, 0.8, 4), frameMat);
-        flagStick.position.set(0.08, 0.55, 0);
-        armPivot.add(flagStick);
-
-        const miniFlagGeom = new THREE.PlaneGeometry(0.42, 0.28);
-        const miniFlagMat = new THREE.MeshBasicMaterial({
-          color: teamColors[cIdx],
-          side: THREE.DoubleSide,
-        });
-        const miniFlag = new THREE.Mesh(miniFlagGeom, miniFlagMat);
-        miniFlag.position.set(0.26, 0.75, 0);
-        armPivot.add(miniFlag);
-      }
-
-      armPivot.rotation.z = -0.6 - Math.random() * 0.6;
-      armPivot.rotation.x = (Math.random() - 0.5) * 0.4;
-      person.add(armPivot);
-
-      person.seed = Math.random() * 100;
-      person.wavingArm = armPivot;
-      person.baseY = 0;
-      this.animatedSpectators.push(person);
-
-      return person;
-    };
+    const createSpectator = (x, y, z, side) => ({
+      x, y, z, heading: -side * Math.PI / 2,
+      shirt: teamColors[Math.floor(Math.random() * teamColors.length)],
+      whiteCap: Math.random() < 0.3,
+      flag: Math.random() > 0.45,
+      seed: Math.random() * 100,
+    });
 
     // Helper: Build Grandstand aligned with track samples
     // Tangent = Z (along track length); Normal = X (across track)
@@ -1460,6 +1342,7 @@ class Track3D {
       const tierWidth = 1.35;
       const tierHeight = 0.65;
       const depth = tiers * tierWidth;
+      const spectators = [];
 
       // Tiered steps running along Z (track length)
       // Guaranteed strictly outside the track road width
@@ -1475,14 +1358,9 @@ class Track3D {
         const spectatorsOnTier = Math.floor(lengthMeters / 1.15);
         for (let sp = 0; sp < spectatorsOnTier; sp++) {
           if (Math.random() > 0.15) { // 85% full grandstand
-            const spectator = createSpectator(true);
             const zPos = -lengthMeters / 2 + 1.2 + sp * 1.15 + (Math.random() - 0.5) * 0.2;
             const yPos = (t + 1) * tierHeight;
-            spectator.position.set(xTier, yPos, zPos);
-            spectator.baseY = yPos;
-            // Face the track (towards center X = 0)
-            spectator.rotation.y = side > 0 ? -Math.PI / 2 : Math.PI / 2;
-            grandstandGroup.add(spectator);
+            spectators.push(createSpectator(xTier, yPos, zPos, side));
           }
         }
       }
@@ -1504,6 +1382,7 @@ class Track3D {
         grandstandGroup.add(pillar);
       }
 
+      this.crowd.addVenue(grandstandGroup, spectators, true);
       this.trackGroup.add(grandstandGroup);
     };
 
@@ -1557,17 +1436,12 @@ class Track3D {
       fieldGroup.add(fenceRail);
 
       // Crowds of spectators gathered on the grassy mound watching the race
+      const spectators = [];
       for (let p = 0; p < zone.count; p++) {
-        const spectator = createSpectator(false);
         const zPos = (Math.random() - 0.5) * (fenceLength * 0.85);
         // Positioned safely behind the safety fence on the mound
         const xPos = fenceX - zone.side * (1.2 + Math.random() * (zone.radius * 0.8));
-        spectator.position.set(xPos, 1.2, zPos);
-        spectator.baseY = 1.2;
-
-        // Face towards the track
-        spectator.rotation.y = zone.side > 0 ? -Math.PI / 2 : Math.PI / 2;
-        fieldGroup.add(spectator);
+        spectators.push(createSpectator(xPos, 1.2, zPos, zone.side));
       }
 
       // Add a Marshall Station with orange-suited marshalls
@@ -1592,25 +1466,9 @@ class Track3D {
       marshalGroup.add(flagMesh);
 
       fieldGroup.add(marshalGroup);
+      this.crowd.addVenue(fieldGroup, spectators, false);
       this.trackGroup.add(fieldGroup);
     });
-  }
-
-  updateAudience(dt) {
-    if (!this.animatedSpectators || this.animatedSpectators.length === 0) return;
-    this.crowdTime = (this.crowdTime || 0) + dt;
-    const t = this.crowdTime;
-
-    for (let i = 0; i < this.animatedSpectators.length; i++) {
-      const sp = this.animatedSpectators[i];
-      if (sp.wavingArm) {
-        sp.wavingArm.rotation.z = -0.6 + Math.sin(t * 5.0 + sp.seed) * 0.5;
-        sp.wavingArm.rotation.x = Math.sin(t * 3.5 + sp.seed * 0.7) * 0.3;
-      }
-      if (sp.seed % 3 === 0) {
-        sp.position.y = sp.baseY + Math.abs(Math.sin(t * 4.0 + sp.seed)) * 0.12;
-      }
-    }
   }
 
   buildOverlays() {
@@ -1643,6 +1501,7 @@ class Track3D {
     brakeGeom.setAttribute("position", new THREE.BufferAttribute(brakePositions, 3));
     const brakeMat = new THREE.LineBasicMaterial({ color: 0xffaa00, linewidth: 4, transparent: true, opacity: 0.85 });
     this.brakingZoneMesh = new THREE.Line(brakeGeom, brakeMat);
+    this.brakingZoneMesh.frustumCulled = false; // The entire line moves along the circuit.
     this.trackGroup.add(this.brakingZoneMesh);
   }
 
@@ -1655,10 +1514,14 @@ class Track3D {
 
     for (let i = 0; i < count; i++) {
       const t = startProgress + (i / count) * (endProgress - startProgress);
-      const s = this.getSampleAt(t);
-      positions[i * 3] = s.position.x;
-      positions[i * 3 + 1] = s.position.y + 0.12;
-      positions[i * 3 + 2] = s.position.z;
+      const index = (t % 1) * this.sampleCount;
+      const previous = Math.floor(index);
+      const a = this.samples[previous].position;
+      const b = this.samples[(previous + 1) % this.sampleCount].position;
+      const fraction = index - previous;
+      positions[i * 3] = THREE.MathUtils.lerp(a.x, b.x, fraction);
+      positions[i * 3 + 1] = THREE.MathUtils.lerp(a.y, b.y, fraction) + 0.12;
+      positions[i * 3 + 2] = THREE.MathUtils.lerp(a.z, b.z, fraction);
     }
     this.brakingZoneMesh.geometry.attributes.position.needsUpdate = true;
   }
@@ -1669,53 +1532,32 @@ class Track3D {
     return this.samples[idx] || this.samples[0];
   }
 
-  getNearestProgress(worldPos, hintProgress = 0) {
-    if (!this.samples || this.samples.length === 0) return 0;
+  getNearestProgress(worldPos, hintProgress = null) {
     const n = this.samples.length;
-    let bestDistSq = Infinity;
-    let bestIdx = 0;
-
-    if (typeof hintProgress === "number" && hintProgress >= 0 && hintProgress <= 1) {
-      const hintIdx = Math.floor(hintProgress * n);
-      const windowRadius = 45;
-      for (let i = -windowRadius; i <= windowRadius; i++) {
-        const idx = (hintIdx + i + n) % n;
-        const sp = this.samples[idx].position;
-        const dx = sp.x - worldPos.x;
-        const dz = sp.z - worldPos.z;
-        const d2 = dx * dx + dz * dz;
-        if (d2 < bestDistSq) {
-          bestDistSq = d2;
-          bestIdx = idx;
-        }
+    if (!n) return 0;
+    let bestDistance = Infinity, bestProgress = 0;
+    const testSegment = i => {
+      const a = this.samples[(i + n) % n].position;
+      const b = this.samples[(i + 1 + n) % n].position;
+      const dx = b.x - a.x, dz = b.z - a.z;
+      const t = THREE.MathUtils.clamp(((worldPos.x - a.x) * dx + (worldPos.z - a.z) * dz) / (dx * dx + dz * dz || 1), 0, 1);
+      const distance = (worldPos.x - a.x - t * dx) ** 2 + (worldPos.z - a.z - t * dz) ** 2;
+      if (distance < bestDistance) {
+        bestDistance = distance;
+        bestProgress = (((i + n) % n + t) / n) % 1;
       }
-      return bestIdx / n;
+    };
+    if (Number.isFinite(hintProgress)) {
+      const index = Math.floor(((hintProgress % 1 + 1) % 1) * n);
+      for (let i = index - 45; i <= index + 45; i++) testSegment(i);
     }
-
-    for (let i = 0; i < n; i += 4) {
-      const sp = this.samples[i].position;
-      const dx = sp.x - worldPos.x;
-      const dz = sp.z - worldPos.z;
-      const d2 = dx * dx + dz * dz;
-      if (d2 < bestDistSq) {
-        bestDistSq = d2;
-        bestIdx = i;
-      }
+    // Retain the local branch at crossings; recover globally after a teleport.
+    if (bestDistance > Math.max(30, this.roadWidth * 3) ** 2) {
+      for (let i = 0; i < n; i++) testSegment(i);
     }
-    const searchStart = Math.max(0, bestIdx - 6);
-    const searchEnd = Math.min(n - 1, bestIdx + 6);
-    for (let i = searchStart; i <= searchEnd; i++) {
-      const sp = this.samples[i].position;
-      const dx = sp.x - worldPos.x;
-      const dz = sp.z - worldPos.z;
-      const d2 = dx * dx + dz * dz;
-      if (d2 < bestDistSq) {
-        bestDistSq = d2;
-        bestIdx = i;
-      }
-    }
-    return bestIdx / n;
+    return bestProgress;
   }
+
 }
 
 /* ==========================================================================
@@ -1754,10 +1596,10 @@ class RaceCar3D {
   }
 
   buildModel() {
-    const carbonMat = new THREE.MeshStandardMaterial({ color: 0x111620, roughness: 0.35, metalness: 0.85 });
-    const liveryCyanMat = new THREE.MeshStandardMaterial({ color: 0x00f2fe, roughness: 0.18, metalness: 0.85 });
+    const carbonMat = new THREE.MeshStandardMaterial({ color: 0x18222a, roughness: 0.48, metalness: 0.24 });
+    const liveryCyanMat = new THREE.MeshStandardMaterial({ color: 0x00dce7, roughness: 0.28, metalness: 0.45 });
     const haloTitaniumMat = new THREE.MeshStandardMaterial({ color: 0x242c38, roughness: 0.25, metalness: 0.95 });
-    const darkAeroMat = new THREE.MeshStandardMaterial({ color: 0x080a0f, roughness: 0.45, metalness: 0.7 });
+    const darkAeroMat = new THREE.MeshStandardMaterial({ color: 0x182333, roughness: 0.49, metalness: 0.33 });
     this.brakeRotorMat = new THREE.MeshStandardMaterial({
       color: 0x6e7884,
       metalness: 0.9,
@@ -1767,77 +1609,61 @@ class RaceCar3D {
     });
     const brakeRotorMat = this.brakeRotorMat;
     const brakeCaliperMat = new THREE.MeshStandardMaterial({ color: 0xff1744, metalness: 0.7, roughness: 0.3 });
-    const rimAlloyMat = new THREE.MeshStandardMaterial({ color: 0x141820, metalness: 0.92, roughness: 0.18 });
+    const rimAlloyMat = new THREE.MeshStandardMaterial({ color: 0x3e484e, metalness: 0.52, roughness: 0.31 });
 
     const chassisGroup = new THREE.Group();
     this.chassisMesh = chassisGroup;
     this.carGroup.add(chassisGroup);
 
-    // 1. Authentic Open-Cockpit Monocoque Architecture (Hollow Cockpit Tub)
-    // Rear engine cover & monocoque bulkhead (behind cockpit)
-    const rearTubGeom = new THREE.BoxGeometry(1.25, 0.42, 1.55);
-    const rearTub = new THREE.Mesh(rearTubGeom, liveryCyanMat);
-    rearTub.position.set(0, 0.42, -0.825);
-    rearTub.castShadow = true;
-    chassisGroup.add(rearTub);
+    const addPart = (name, geometry, material, castsShadow = true) => {
+      const part = new THREE.Mesh(geometry, material);
+      part.name = name;
+      part.castShadow = castsShadow;
+      chassisGroup.add(part);
+      return part;
+    };
+    const body = (name, stations, material = liveryCyanMat) => addPart(name, sculptBody(stations), material);
+    const wing = (name, stations, thickness, camber, material) =>
+      addPart(name, shapeAerofoil(stations, thickness, camber), material);
 
-    // Sleek low-profile front nose bulkhead (narrow and low so road is wide open)
-    const frontTubGeom = new THREE.BoxGeometry(0.46, 0.18, 1.3);
-    const frontTub = new THREE.Mesh(frontTubGeom, liveryCyanMat);
-    frontTub.position.set(0, 0.25, 1.25);
-    frontTub.castShadow = true;
-    chassisGroup.add(frontTub);
+    body("Tapered nose and front monocoque", [
+      [0.58, 0, 0.31, 0.34, 0.18], [0.87, 0, 0.33, 0.34, 0.16],
+      [1.37, 0, 0.32, 0.29, 0.135], [1.81, 0, 0.28, 0.22, 0.106],
+      [2.25, 0, 0.24, 0.155, 0.070], [2.68, 0, 0.21, 0.10, 0.042],
+      [2.94, 0, 0.196, 0.063, 0.029], [3.01, 0, 0.193, 0.018, 0.012],
+    ]);
+    body("Carbon floor and rear diffuser", [
+      [-2.22, 0, 0.24, 0.58, 0.039], [-1.68, 0, 0.165, 0.64, 0.038],
+      [-0.95, 0, 0.139, 0.90, 0.035], [0.12, 0, 0.137, 0.99, 0.031],
+      [0.68, 0, 0.14, 0.89, 0.042], [0.93, 0, 0.16, 0.46, 0.043],
+      [1.13, 0, 0.17, 0.32, 0.029],
+    ], darkAeroMat);
+    body("Cockpit floor", [[-0.23, 0, 0.253, 0.32, 0.044], [0.59, 0, 0.245, 0.32, 0.043]], carbonMat);
+    for (const side of [-1, 1]) {
+      body("Rounded cockpit surround", [
+        [-0.4, side * 0.321, 0.470, 0.1, 0.12], [-0.05, side * 0.344, 0.473, 0.083, 0.095],
+        [0.31, side * 0.343, 0.432, 0.078, 0.074], [0.58, side * 0.316, 0.413, 0.075, 0.068],
+        [0.79, side * 0.25, 0.400, 0.068, 0.061],
+      ]);
+    }
 
-    // Left and right cockpit side bolsters (low-profile sleek rims)
-    [-0.36, 0.36].forEach((sideX) => {
-      const rimGeom = new THREE.BoxGeometry(0.12, 0.22, 0.65);
-      const rimMesh = new THREE.Mesh(rimGeom, liveryCyanMat);
-      rimMesh.position.set(sideX, 0.32, 0.26);
-      chassisGroup.add(rimMesh);
-    });
-
-    // Cockpit interior floor tray (under driver seat)
-    const floorGeom = new THREE.BoxGeometry(0.68, 0.06, 0.65);
-    const floorMesh = new THREE.Mesh(floorGeom, darkAeroMat);
-    floorMesh.position.set(0, 0.22, 0.26);
-    chassisGroup.add(floorMesh);
-
-    // Smooth Slanted Needle Nosecone
-    const noseGeom = new THREE.ConeGeometry(0.38, 1.8, 20);
-    const nose = new THREE.Mesh(noseGeom, liveryCyanMat);
-    nose.rotation.x = Math.PI / 2 + 0.08;
-    nose.position.set(0, 0.32, 2.45);
-    nose.castShadow = true;
-    chassisGroup.add(nose);
-
-    // Nose Pylons
-    [-0.16, 0.16].forEach((px) => {
-      const pylonGeom = new THREE.BoxGeometry(0.06, 0.22, 0.35);
-      const pylon = new THREE.Mesh(pylonGeom, darkAeroMat);
-      pylon.position.set(px, 0.18, 2.85);
-      chassisGroup.add(pylon);
-    });
-
-    // 2. High-Downforce Front Wing with Aerofoil Cascade
-    const frontWingMainGeom = new THREE.BoxGeometry(2.35, 0.05, 0.65);
-    const frontWingMain = new THREE.Mesh(frontWingMainGeom, darkAeroMat);
-    frontWingMain.position.set(0, 0.15, 3.0);
-    frontWingMain.castShadow = true;
-    chassisGroup.add(frontWingMain);
-
-    const frontUpperFlapGeom = new THREE.BoxGeometry(2.15, 0.04, 0.35);
-    const frontUpperFlap = new THREE.Mesh(frontUpperFlapGeom, liveryCyanMat);
-    frontUpperFlap.position.set(0, 0.22, 2.92);
-    frontUpperFlap.rotation.x = 0.12;
-    chassisGroup.add(frontUpperFlap);
-
-    // Curved Front Endplates with Vortex Fins
-    [-1.18, 1.18].forEach((ex) => {
-      const frontEndplateGeom = new THREE.BoxGeometry(0.04, 0.42, 0.85);
-      const frontEndplate = new THREE.Mesh(frontEndplateGeom, liveryCyanMat);
-      frontEndplate.position.set(ex, 0.25, 3.0);
-      chassisGroup.add(frontEndplate);
-    });
+    wing("Swept carbon front wing", [
+      [-1.18, 3.02, 0.35, 0.185], [-1.06, 3.13, 0.52, 0.135], [-0.69, 3.22, 0.58, 0.124],
+      [-0.3, 3.27, 0.55, 0.143], [0, 3.26, 0.51, 0.154], [0.3, 3.27, 0.55, 0.143],
+      [0.69, 3.22, 0.58, 0.124], [1.06, 3.13, 0.52, 0.135], [1.18, 3.02, 0.35, 0.185],
+    ], 0.036, 0.035, darkAeroMat);
+    for (const side of [-1, 1]) {
+      const flap = [
+        [0.25, 3.01, 0.23, 0.168], [0.5, 2.99, 0.335, 0.218], [0.85, 2.98, 0.35, 0.238],
+        [1.03, 2.94, 0.32, 0.260], [1.15, 2.90, 0.25, 0.264],
+      ].map(([x, ...station]) => [x * side, ...station]).sort((a, b) => a[0] - b[0]);
+      wing("Front wing flap", flap, 0.022, 0.041, liveryCyanMat);
+      const plate = addPart("Front wing endplate", shapePanel([
+        [-0.32, 0.10], [-0.32, 0.19], [-0.11, 0.33], [0.22, 0.36], [0.33, 0.25], [0.35, 0.115],
+      ], 0.027, 0.014), liveryCyanMat);
+      plate.rotation.y = Math.PI / 2;
+      plate.position.set(side * 1.17, 0, 2.96);
+    }
 
     // 3. Titanium HALO Safety Structure
     const haloGroup = new THREE.Group();
@@ -1935,60 +1761,51 @@ class RaceCar3D {
     this.steeringWheelMesh = steerWheelGroup;
     chassisGroup.add(steerWheelGroup);
 
-    // 5. Sculpted Sidepods with Downwash Channels
-    [-1, 1].forEach((side) => {
-      const sidepodGeom = new THREE.BoxGeometry(0.48, 0.38, 1.9);
-      const sidepod = new THREE.Mesh(sidepodGeom, liveryCyanMat);
-      sidepod.position.set(side * 0.76, 0.38, -0.2);
-      sidepod.castShadow = true;
-      chassisGroup.add(sidepod);
+    for (const side of [-1, 1]) {
+      body("Sculpted sidepod", [
+        [-1.77, side * 0.30, 0.255, 0.13, 0.09], [-1.35, side * 0.41, 0.28, 0.19, 0.105],
+        [-0.89, side * 0.54, 0.349, 0.27, 0.145], [-0.31, side * 0.64, 0.393, 0.31, 0.21],
+        [0.27, side * 0.65, 0.429, 0.31, 0.239], [0.61, side * 0.65, 0.434, 0.27, 0.176],
+        [0.78, side * 0.63, 0.443, 0.185, 0.11], [0.83, side * 0.62, 0.454, 0.13, 0.075],
+      ]);
+      body("Sidepod intake", [
+        [0.793, side * 0.629, 0.454, 0.15, 0.083], [0.839, side * 0.624, 0.454, 0.12, 0.061],
+      ], carbonMat);
+    }
 
-      const ductGeom = new THREE.BoxGeometry(0.42, 0.32, 0.12);
-      const duct = new THREE.Mesh(ductGeom, darkAeroMat);
-      duct.position.set(side * 0.76, 0.38, 0.76);
-      chassisGroup.add(duct);
+    body("Tapered engine cover", [
+      [-2.14, 0, 0.28, 0.14, 0.115], [-1.70, 0, 0.34, 0.237, 0.17],
+      [-1.23, 0, 0.44, 0.31, 0.255], [-0.77, 0, 0.53, 0.38, 0.34],
+      [-0.38, 0, 0.55, 0.39, 0.365], [-0.15, 0, 0.472, 0.32, 0.236],
+      [-0.06, 0, 0.43, 0.19, 0.16],
+    ]);
+    body("Roll hoop air intake", [
+      [-0.75, 0, 0.79, 0.06, 0.085], [-0.50, 0, 0.892, 0.135, 0.115],
+      [-0.29, 0, 0.94, 0.149, 0.121], [-0.15, 0, 0.953, 0.117, 0.09],
+    ]);
+    body("Air intake throat", [[-0.16, 0, 0.962, 0.099, 0.067], [-0.133, 0, 0.962, 0.082, 0.054]], carbonMat);
+    const fin = addPart("Sculpted engine cover fin", shapePanel([
+      [0.16, 0.85], [0.34, 1.02], [0.69, 0.94], [1.62, 0.705], [1.75, 0.565], [0.58, 0.64],
+    ], 0.024, 0.01), liveryCyanMat);
+    fin.rotation.y = Math.PI / 2;
 
-      const floorGeom = new THREE.BoxGeometry(0.55, 0.04, 2.6);
-      const floor = new THREE.Mesh(floorGeom, darkAeroMat);
-      floor.position.set(side * 0.88, 0.16, -0.2);
-      chassisGroup.add(floor);
-    });
-
-    // 6. Overhead Engine Airbox & Aerodynamic Shark Fin
-    const airboxGeom = new THREE.BoxGeometry(0.32, 0.32, 0.6);
-    const airbox = new THREE.Mesh(airboxGeom, liveryCyanMat);
-    airbox.position.set(0, 0.88, -0.22);
-    chassisGroup.add(airbox);
-
-    const sharkFinGeom = new THREE.BoxGeometry(0.04, 0.55, 1.4);
-    const sharkFin = new THREE.Mesh(sharkFinGeom, liveryCyanMat);
-    sharkFin.position.set(0, 0.86, -1.1);
-    chassisGroup.add(sharkFin);
-
-    // 7. Dual-Plane Contoured Rear Wing & DRS Pod
-    const rearWingMainGeom = new THREE.BoxGeometry(1.95, 0.06, 0.65);
-    const rearWingMain = new THREE.Mesh(rearWingMainGeom, liveryCyanMat);
-    rearWingMain.position.set(0, 1.08, -2.15);
-    rearWingMain.castShadow = true;
-    chassisGroup.add(rearWingMain);
-
-    const rearWingUpperGeom = new THREE.BoxGeometry(1.9, 0.04, 0.35);
-    const rearWingUpper = new THREE.Mesh(rearWingUpperGeom, darkAeroMat);
-    rearWingUpper.position.set(0, 1.2, -2.25);
-    rearWingUpper.rotation.x = -0.16;
-    chassisGroup.add(rearWingUpper);
-
-    const drsPodGeom = new THREE.BoxGeometry(0.12, 0.14, 0.2);
-    const drsPod = new THREE.Mesh(drsPodGeom, carbonMat);
-    drsPod.position.set(0, 1.15, -2.15);
-    chassisGroup.add(drsPod);
-
-    [-0.98, 0.98].forEach((rx) => {
-      const rearEndplateGeom = new THREE.BoxGeometry(0.04, 0.72, 0.95);
-      const rearEndplate = new THREE.Mesh(rearEndplateGeom, darkAeroMat);
-      rearEndplate.position.set(rx, 1.0, -2.15);
-      chassisGroup.add(rearEndplate);
-    });
+    wing("Rear wing mainplane", [
+      [-0.95, -1.89, 0.60, 0.98], [-0.78, -1.84, 0.68, 1.02], [-0.33, -1.76, 0.68, 1.035],
+      [0, -1.75, 0.67, 1.035], [0.33, -1.76, 0.68, 1.035], [0.78, -1.84, 0.68, 1.02], [0.95, -1.89, 0.60, 0.98],
+    ], 0.034, 0.095, liveryCyanMat);
+    wing("Rear wing upper flap", [
+      [-0.925, -2.09, 0.46, 1.17], [-0.61, -2.05, 0.51, 1.21], [0, -2.01, 0.53, 1.225],
+      [0.61, -2.05, 0.51, 1.21], [0.925, -2.09, 0.46, 1.17],
+    ], 0.023, 0.078, darkAeroMat);
+    for (const side of [-1, 1]) {
+      const plate = addPart("Rear wing endplate", shapePanel([
+        [-0.32, 0.79], [-0.29, 1.06], [-0.16, 1.21], [0.29, 1.28], [0.39, 1.19],
+        [0.38, 0.86], [0.22, 0.74], [-0.08, 0.75],
+      ], 0.04, 0.025), darkAeroMat);
+      plate.rotation.y = Math.PI / 2;
+      plate.position.set(side * 0.94, 0, -2.17);
+      body("Rear wing support", [[-2.22, side * 0.23, 0.64, 0.038, 0.34], [-1.97, side * 0.23, 0.65, 0.036, 0.33]], darkAeroMat);
+    }
 
     // 8. Functioning FIA Rain / Brake LED Light
     const lightGeom = new THREE.BoxGeometry(0.38, 0.18, 0.06);
@@ -2018,16 +1835,16 @@ class RaceCar3D {
 
     createWishbones(-1.18, 0.38, 1.45);
     createWishbones(1.18, 0.38, 1.45);
-    createWishbones(-1.22, 0.42, -1.45);
-    createWishbones(1.22, 0.42, -1.45);
+    createWishbones(-1.22, 0.38, -1.45);
+    createWishbones(1.22, 0.38, -1.45);
 
     // 10. Open-Wheel Assemblies with Visible Spinning
     const tireRadius = 0.38;
-    const tireWidth = 0.34;
     const rimRadius = tireRadius * 0.62;
     const tireSidewallTex = createWheelSidewallTexture("#ffd200");
 
     const createWheel = (x, y, z, isFront) => {
+      const tireWidth = isFront ? 0.34 : 0.46;
       const hubGroup = new THREE.Group();
       hubGroup.position.set(x, y, z);
 
@@ -2046,15 +1863,14 @@ class RaceCar3D {
       const rollGroup = new THREE.Group();
       hubGroup.add(rollGroup);
 
-      const tireGeom = new THREE.CylinderGeometry(tireRadius, tireRadius, tireWidth, 24);
-      tireGeom.rotateZ(Math.PI / 2);
-      const tireTreadMat = new THREE.MeshStandardMaterial({ color: 0x14161a, roughness: 0.92, metalness: 0.08 });
+      const tireGeom = shapeSlick(tireRadius, tireWidth, rimRadius * 0.97);
+      const tireTreadMat = new THREE.MeshStandardMaterial({ color: 0x20252b, roughness: 0.87, metalness: 0.04 });
       const tire = new THREE.Mesh(tireGeom, tireTreadMat);
       tire.castShadow = true;
       rollGroup.add(tire);
 
       // Pirelli Sidewall Face Disc
-      const sidewallGeom = new THREE.CircleGeometry(tireRadius, 24);
+      const sidewallGeom = new THREE.CircleGeometry(tireRadius * 0.89, 32);
       const sidewallMat = new THREE.MeshBasicMaterial({
         map: tireSidewallTex,
         transparent: true,
@@ -2113,8 +1929,8 @@ class RaceCar3D {
 
     createWheel(-1.18, 0.38, 1.45, true);  // Front Left
     createWheel(1.18, 0.38, 1.45, true);   // Front Right
-    createWheel(-1.22, 0.42, -1.45, false); // Rear Left
-    createWheel(1.22, 0.42, -1.45, false);  // Rear Right
+    createWheel(-1.22, 0.38, -1.45, false); // Rear Left
+    createWheel(1.22, 0.38, -1.45, false);  // Rear Right
   }
 
   updateDashboard(speedMph, speedKmh, rpm, gear, throttle, brake, delta, lap, maxLaps, latG) {
@@ -2503,11 +2319,18 @@ class CameraManager3D {
     this.lookPos = new THREE.Vector3();
 
     this.orbitDistance = 145;
-    this.orbitTheta = 0;
-    this.orbitPhi = Math.PI / 4;
+    this.orbitTarget = new THREE.Vector3();
+    this.orbitFocus = new THREE.Vector3();
+    this.orbitDirection = new THREE.Vector3();
+    this.orbitRadius = 100;
+    this.orbitFitDistance = 145;
+    this.resetTrackAngles();
+    this.resetAerialView();
     this.isDragging = false;
     this.prevMouse = { x: 0, y: 0 };
     this.locked = false;
+    this.editingTrack = false;
+    this.pinchSpan = 0;
 
     this.cameraYaw = 0; // Filtered camera yaw for rock-solid stability in turns
     this.cameraInitialized = false;
@@ -2519,14 +2342,141 @@ class CameraManager3D {
     this.bindEvents();
   }
 
+  setTrack(track) {
+    this.orbitSamples = track.samples;
+    this.orbitMargin = track.roadWidth / 2 + 16;
+    this.gantryPosition = track.gantryPosition;
+    this.fitTrack(1, true);
+  }
+
+  circuitBounds(theta) {
+    const sin = Math.sin(theta), cos = Math.cos(theta);
+    let minX = Infinity, maxX = -Infinity, minZ = Infinity, maxZ = -Infinity;
+    for (const { position } of this.orbitSamples) {
+      const x = position.x * cos - position.z * sin;
+      const z = position.x * sin + position.z * cos;
+      minX = Math.min(minX, x);
+      maxX = Math.max(maxX, x);
+      minZ = Math.min(minZ, z);
+      maxZ = Math.max(maxZ, z);
+    }
+    return { minX, maxX, minZ, maxZ };
+  }
+
+  fitTrack(zoom = 1, orient = false) {
+    // Reserve the drawer/header space so the fitted track remains visible.
+    const panelWidth = id => {
+      const el = $(id);
+      return el && !el.classList.contains("collapsed") ? (el.getBoundingClientRect?.().width || 320) + 40 : 24;
+    };
+    const widthFraction = Math.max(0.2, 1 - 2 * Math.max(panelWidth("leftPanel"), panelWidth("rightPanel")) / window.innerWidth);
+    const heightFraction = Math.max(0.3, 1 - 176 / window.innerHeight);
+    const tanHalfFov = Math.tan(THREE.MathUtils.degToRad(50 / 2));
+    const horizontal = tanHalfFov * this.camera.aspect * widthFraction;
+    const vertical = tanHalfFov * heightFraction;
+    let bounds = this.circuitBounds(this.orbitTheta);
+    if (orient && this.mode === "orbit" && this.orbitPhi > 1.56) {
+      const framingSize = ({ minX, maxX, minZ, maxZ }) => Math.max(
+        (maxX - minX + 2 * this.orbitMargin) / horizontal,
+        (maxZ - minZ + 2 * this.orbitMargin) / vertical,
+      );
+      this.orbitTheta = 0;
+      bounds = this.circuitBounds(0);
+      let bestSize = framingSize(bounds);
+      for (let step = -29; step <= 30; step++) {
+        const theta = step * Math.PI / 60;
+        const candidate = this.circuitBounds(theta);
+        const size = framingSize(candidate);
+        if (size < bestSize) {
+          this.orbitTheta = theta;
+          bounds = candidate;
+          bestSize = size;
+        }
+      }
+    }
+    const sinTheta = Math.sin(this.orbitTheta), cosTheta = Math.cos(this.orbitTheta);
+    const sinPhi = Math.sin(this.orbitPhi), cosPhi = Math.cos(this.orbitPhi);
+    this.orbitDirection.set(sinTheta * cosPhi, sinPhi, cosTheta * cosPhi);
+    const { minX, maxX, minZ, maxZ } = bounds;
+    const centerX = (minX + maxX) * 0.5;
+    const centerZ = (minZ + maxZ) * 0.5;
+    const halfWidth = (maxX - minX) * 0.5 + this.orbitMargin;
+    const halfDepth = (maxZ - minZ) * 0.5 + this.orbitMargin;
+    this.orbitTarget.set(centerX * cosTheta + centerZ * sinTheta, 0, -centerX * sinTheta + centerZ * cosTheta);
+    this.orbitRadius = Math.hypot(halfWidth, halfDepth);
+
+    // Test the corners of the footprint in the camera's rotated basis.
+    let distance = 0;
+    for (const y of [0, 10]) {
+      for (const z of [-halfDepth, halfDepth]) {
+        const depth = y * sinPhi + z * cosPhi;
+        const up = y * cosPhi - z * sinPhi;
+        distance = Math.max(distance, depth + Math.max(halfWidth / horizontal, Math.abs(up) / vertical));
+      }
+    }
+    this.orbitFitDistance = distance * 1.025;
+    this.orbitDistance = THREE.MathUtils.clamp(this.orbitFitDistance * zoom, this.orbitMinDistance, this.orbitFitDistance * 4);
+    this.fittedTheta = this.orbitTheta;
+    this.fittedPhi = this.orbitPhi;
+    this.updateZoomButtons();
+  }
+
   setMode(mode) {
     this.mode = mode;
     this.cameraInitialized = false;
+    this.pinchSpan = 0;
+    this.domElement.classList.toggle("circuit-camera", mode === "orbit");
+    $("circuitZoomControls").hidden = mode !== "orbit";
+    if (this.isTrackOrbit) this.resetOrbitView();
+  }
+
+  resetOrbitView() {
+    this.resetTrackAngles();
+    this.fitTrack(1, true);
+  }
+
+  resetTrackAngles() {
+    this.orbitTheta = 0;
+    this.orbitPhi = Math.PI / 2 - 0.00001;
+  }
+
+  get isTrackOrbit() {
+    return this.mode === "orbit" || this.mode === "map";
+  }
+
+  get isAerialView() {
+    return this.mode === "aerial" || this.isTrackOrbit;
+  }
+
+  get orbitMinDistance() {
+    return this.mode === "orbit" && !this.editingTrack ? 55 : this.orbitFitDistance * 0.08;
+  }
+
+  updateZoomButtons() {
+    if (this.mode !== "orbit") return;
+    $("btnCircuitZoomIn").disabled = this.orbitDistance <= this.orbitMinDistance;
+    $("btnCircuitZoomOut").disabled = this.orbitDistance >= this.orbitFitDistance * 4;
+  }
+
+  zoomBy(scale) {
+    if (this.locked) return;
+    if (this.mode === "aerial") {
+      this.aerialDistance = THREE.MathUtils.clamp(this.aerialDistance * scale, 22, 135);
+    } else if (this.isTrackOrbit) {
+      this.orbitDistance = THREE.MathUtils.clamp(this.orbitDistance * scale, this.orbitMinDistance, this.orbitFitDistance * 4);
+      this.updateZoomButtons();
+    }
+  }
+
+  resetAerialView() {
+    this.aerialDistance = 46;
+    this.aerialAzimuth = -2.05;
+    this.aerialElevation = THREE.MathUtils.degToRad(59);
   }
 
   bindEvents() {
     this.domElement.addEventListener("mousedown", (e) => {
-      if (this.mode === "orbit" && !this.locked) {
+      if (this.isAerialView && !this.locked && e.button === 0) {
         this.isDragging = true;
         this.prevMouse.x = e.clientX;
         this.prevMouse.y = e.clientY;
@@ -2538,33 +2488,79 @@ class CameraManager3D {
     });
 
     window.addEventListener("mousemove", (e) => {
-      if (this.mode === "orbit" && !this.locked && this.isDragging) {
+      if (this.isAerialView && !this.locked && this.isDragging) {
         const dx = e.clientX - this.prevMouse.x;
         const dy = e.clientY - this.prevMouse.y;
         this.prevMouse.x = e.clientX;
         this.prevMouse.y = e.clientY;
 
-        this.orbitTheta -= dx * 0.006;
-        this.orbitPhi = Math.max(0.1, Math.min(Math.PI / 2.1, this.orbitPhi - dy * 0.006));
+        if (this.mode === "aerial") {
+          this.aerialAzimuth -= dx * 0.006;
+          this.aerialElevation = THREE.MathUtils.clamp(this.aerialElevation - dy * 0.006, 0.48, 1.55);
+        } else {
+          this.orbitTheta -= dx * 0.006;
+          this.orbitPhi = THREE.MathUtils.clamp(this.orbitPhi - dy * 0.006, 0.1, Math.PI / 2 - 0.00001);
+        }
       }
     });
 
+    this.domElement.addEventListener("dblclick", () => {
+      if (this.locked) return;
+      if (this.mode === "aerial") {
+        this.resetAerialView();
+        this.cameraInitialized = false;
+      } else if (this.isTrackOrbit) {
+        this.resetOrbitView();
+      }
+    });
     this.domElement.addEventListener("wheel", (e) => {
-      if (this.mode === "orbit" && !this.locked) {
-        this.orbitDistance = Math.max(30, Math.min(260, this.orbitDistance + e.deltaY * 0.08));
+      if (this.isAerialView && !this.locked) {
+        e.preventDefault();
+        const units = e.deltaMode === 1 ? 16 : e.deltaMode === 2 ? window.innerHeight : 1;
+        this.zoomBy(Math.exp(e.deltaY * units * 0.001));
       } else if (this.mode === "chase") {
         this.chaseDistance = Math.max(15, Math.min(60, (this.chaseDistance || 28.0) + e.deltaY * 0.03));
         this.chaseHeight = this.chaseDistance * 0.29;
       }
+    }, { passive: false });
+
+    const updatePinch = (e) => {
+      if (this.mode !== "orbit" || this.locked || e.targetTouches.length !== 2) {
+        this.pinchSpan = 0;
+        return;
+      }
+      const a = e.targetTouches[0], b = e.targetTouches[1];
+      const span = Math.hypot(a.clientX - b.clientX, a.clientY - b.clientY);
+      if (e.type === "touchmove" && this.pinchSpan > 0 && span > 0) {
+        e.preventDefault();
+        this.zoomBy(this.pinchSpan / span);
+      }
+      this.pinchSpan = span;
+    };
+    this.domElement.addEventListener("touchstart", updatePinch);
+    this.domElement.addEventListener("touchmove", updatePinch, { passive: false });
+    this.domElement.addEventListener("touchend", updatePinch);
+    this.domElement.addEventListener("touchcancel", () => { this.pinchSpan = 0; });
+
+    $("btnCircuitZoomIn").addEventListener("click", () => this.zoomBy(0.72));
+    $("btnCircuitZoomOut").addEventListener("click", () => this.zoomBy(1 / 0.72));
+    $("btnCircuitFit").addEventListener("click", () => {
+      if (!this.locked && this.mode === "orbit") this.resetOrbitView();
     });
   }
 
-  update(carGroup, forwardDir, speed, dt) {
-    const carPos = carGroup.position;
+  update(carGroup, forwardDir, speed, dt, editingTrack = false, carPos = carGroup.position) {
+    if (this.editingTrack !== editingTrack) {
+      this.editingTrack = editingTrack;
+      this.updateZoomButtons();
+    }
 
     if (this.mode === "chase") {
-      const chaseOffsetDist = this.chaseDistance || 34.0;
-      const chaseHeight = this.chaseHeight || 9.6;
+      const chaseOffsetDist = this.chaseDistance;
+      const gateDistance = Math.hypot(carPos.x - this.gantryPosition.x, carPos.z - this.gantryPosition.z);
+      const gateClearance = THREE.MathUtils.smoothstep(gateDistance, chaseOffsetDist + 16, chaseOffsetDist + 48);
+      // Go under the start light housing while the camera crosses the bridge.
+      const chaseHeight = THREE.MathUtils.lerp(4.1, this.chaseHeight, gateClearance);
 
       const carYaw = Math.atan2(forwardDir.x, forwardDir.z);
       if (!this.cameraInitialized) {
@@ -2605,8 +2601,8 @@ class CameraManager3D {
       this.camera.lookAt(this.currentLookAt);
 
       const targetFOV = 52 + Math.abs(speed * MS_TO_MPH) * 0.05;
-      const newFOV = THREE.MathUtils.lerp(this.camera.fov, Math.min(68, targetFOV), 0.08);
-      if (Math.abs(newFOV - this.camera.fov) > 0.04) {
+      const newFOV = THREE.MathUtils.lerp(this.camera.fov, Math.min(68, targetFOV), 1 - Math.exp(-5 * dt));
+      if (newFOV !== this.camera.fov) {
         this.camera.fov = newFOV;
         this.camera.updateProjectionMatrix();
       }
@@ -2628,13 +2624,58 @@ class CameraManager3D {
         this.camera.updateProjectionMatrix();
       }
 
-    } else if (this.mode === "orbit") {
-      const x = Math.sin(this.orbitTheta) * Math.cos(this.orbitPhi) * this.orbitDistance;
-      const z = Math.cos(this.orbitTheta) * Math.cos(this.orbitPhi) * this.orbitDistance;
-      const y = Math.sin(this.orbitPhi) * this.orbitDistance;
+    } else if (this.mode === "aerial") {
+      // Let the helicopter coast through changes in direction while its gimbal
+      // stays aimed at the car and the piece of road immediately ahead.
+      const heading = Math.atan2(forwardDir.x, forwardDir.z);
+      if (!this.cameraInitialized) this.cameraYaw = heading;
+      const turn = heading - this.cameraYaw;
+      this.cameraYaw += Math.atan2(Math.sin(turn), Math.cos(turn)) * (1 - Math.exp(-2.6 * dt));
 
-      this.camera.position.set(x, y, z);
-      this.camera.lookAt(0, 0, 0);
+      const azimuth = this.cameraYaw + this.aerialAzimuth;
+      const distance = this.aerialDistance * (1 + Math.min(Math.abs(speed) / 350, 0.2));
+      const groundDistance = Math.cos(this.aerialElevation) * distance;
+      const travelLead = speed * 0.13;
+      this.desiredPos.set(
+        carPos.x + Math.sin(azimuth) * groundDistance + forwardDir.x * travelLead,
+        carPos.y + Math.sin(this.aerialElevation) * distance,
+        carPos.z + Math.cos(azimuth) * groundDistance + forwardDir.z * travelLead,
+      );
+      if (this.cameraInitialized) {
+        this.currentPos.lerp(this.desiredPos, 1 - Math.exp(-7.5 * dt));
+      } else {
+        this.currentPos.copy(this.desiredPos);
+        this.cameraInitialized = true;
+      }
+      const framingLead = Math.min(distance * 0.14, 4 + Math.abs(speed) * 0.04) * Math.sign(speed || 1);
+      this.desiredLookAt.copy(carPos).addScaledVector(forwardDir, framingLead);
+      this.desiredLookAt.y += 0.4;
+      this.camera.position.copy(this.currentPos);
+      this.camera.lookAt(this.desiredLookAt);
+      if (this.camera.fov !== 36) {
+        this.camera.fov = 36;
+        this.camera.updateProjectionMatrix();
+      }
+
+    } else if (this.isTrackOrbit) {
+      if (this.fittedTheta !== this.orbitTheta || this.fittedPhi !== this.orbitPhi) {
+        this.fitTrack(this.orbitDistance / this.orbitFitDistance);
+      }
+      const zoom = this.orbitDistance / this.orbitFitDistance;
+      const follow = this.mode === "orbit" && !editingTrack
+        ? THREE.MathUtils.smoothstep(1 - zoom, 0.10, 0.66)
+        : 0;
+      this.desiredLookAt.copy(this.orbitTarget).lerp(carPos, follow);
+      this.desiredLookAt.addScaledVector(forwardDir, follow * speed * 0.12);
+      if (follow > 0 && this.cameraInitialized) {
+        this.orbitFocus.lerp(this.desiredLookAt, 1 - Math.exp(-8 * dt));
+      } else {
+        this.orbitFocus.copy(this.desiredLookAt);
+      }
+      this.cameraInitialized = true;
+      this.camera.position.copy(this.orbitFocus).addScaledVector(this.orbitDirection, this.orbitDistance);
+      this.camera.lookAt(this.orbitFocus);
+      this.camera.far = Math.max(35000, this.orbitDistance + this.orbitRadius * 3);
       this.camera.fov = 50;
       this.camera.updateProjectionMatrix();
     }
@@ -2944,7 +2985,51 @@ class HeuristicNPCDriver {
     this.lapNumber = lap;
     if (track) {
       this.generateLapPath(lap, track);
+      this.buildSpeedProfile(track);
     }
+  }
+
+  buildSpeedProfile(track) {
+    const n = track.sampleCount;
+    const grip = track.app?.tireGrip || 1.10;
+    const maxSpeed = 228 * MPH_TO_MS;
+    const speeds = new Float32Array(n);
+    const curvature = new Float32Array(n);
+    // Sample the actual offset path, including the intervals between road samples.
+    for (let i = 0; i < n; i++) {
+      curvature[i] = Math.max(track.getPathCurvature(i / n), track.getPathCurvature((i + 0.5) / n));
+    }
+    for (let i = 0; i < n; i++) {
+      const k = Math.max(curvature[(i - 1 + n) % n], curvature[i], curvature[(i + 1) % n]);
+      let low = 0, high = maxSpeed;
+      for (let iteration = 0; iteration < 24; iteration++) {
+        const v = (low + high) / 2;
+        const available = Math.min(54, grip * G_ACCEL * (1 + Math.min(4.4, (v / 26) ** 2 * 0.52)));
+        if (v * v * k <= available * 0.90) low = v;
+        else high = v;
+      }
+      speeds[i] = low;
+    }
+    // Backward braking envelope across the closed lap, with a conservative
+    // deceleration budget that leaves room for steering and acceleration ramping.
+    const cornerSpeeds = speeds.slice();
+    const ds = track.totalLength / n;
+    for (let pass = 0; pass < 2; pass++) {
+      for (let i = n - 1; i >= 0; i--) {
+        speeds[i] = Math.min(speeds[i], Math.sqrt(speeds[(i + 1) % n] ** 2 + 2 * 24 * ds));
+      }
+    }
+    this.speedProfile = speeds;
+    track.overviewGuidance = Uint8Array.from(speeds, (speed, i) => {
+      if (speed < cornerSpeeds[i] - 2) return 2;
+      return cornerSpeeds[i] < maxSpeed * 0.9 ? 1 : 0;
+    });
+  }
+
+  getPlannedSpeed(progress, track) {
+    const index = ((progress % 1 + 1) % 1) * track.sampleCount;
+    const i = Math.floor(index);
+    return THREE.MathUtils.lerp(this.speedProfile[i], this.speedProfile[(i + 1) % track.sampleCount], index - i);
   }
 
   evaluateLap(lapTime) {
@@ -3018,6 +3103,7 @@ class TireSmokeAndSkidSystem {
     });
     this.instancedMesh = new THREE.InstancedMesh(geom, this.smokeMat, this.maxParticles);
     this.instancedMesh.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
+    this.instancedMesh.frustumCulled = false;
     this.scene.add(this.instancedMesh);
 
     const dummy = new THREE.Object3D();
@@ -3049,6 +3135,7 @@ class TireSmokeAndSkidSystem {
       opacity: 0.78,
     });
     this.skidLine = new THREE.LineSegments(this.skidGeom, skidMat);
+    this.skidLine.frustumCulled = false;
     this.scene.add(this.skidLine);
     this.skidWriteIndex = 0;
   }
@@ -3084,7 +3171,7 @@ class TireSmokeAndSkidSystem {
   }
 
   update(dt, camera) {
-    const dummy = new THREE.Object3D();
+    const dummy = this.dummy || (this.dummy = new THREE.Object3D());
     let needsUpdate = false;
 
     for (let i = 0; i < this.maxParticles; i++) {
@@ -3125,81 +3212,6 @@ class TireSmokeAndSkidSystem {
     this.instancedMesh.instanceMatrix.needsUpdate = true;
     this.skidPositions.fill(0);
     this.skidGeom.attributes.position.needsUpdate = true;
-  }
-}
-
-/* ==========================================================================
-   Beta: Multi-Car Sparring AI Opponent (Dynamic Racing Agent)
-   ========================================================================== */
-
-class OpponentCarAgent {
-  constructor(scene) {
-    this.scene = scene;
-    this.car = new RaceCar3D(scene);
-    this.recolorLivery();
-
-    this.progress = 0.07;
-    this.speed = 52.0;
-    this.targetSpeed = 52.0;
-    this.lateralOffset = 1.75;
-    this.enabled = true;
-    this.tempVec = new THREE.Vector3();
-  }
-
-  recolorLivery() {
-    const scarletMat = new THREE.MeshStandardMaterial({ color: 0xcc0000, roughness: 0.22, metalness: 0.85 });
-    this.car.carGroup.traverse((child) => {
-      if (child.isMesh && child.material) {
-        if (child.material.color && (child.material.color.getHex() === 0x00f2fe || child.material.color.getHex() === 0x00c4cc)) {
-          child.material = scarletMat;
-        }
-      }
-    });
-  }
-
-  update(dt, track, playerProgress, playerSpeed) {
-    if (!this.enabled || !track) {
-      this.car.carGroup.visible = false;
-      return;
-    }
-    this.car.carGroup.visible = true;
-
-    const trackLength = track.totalLength || 5000;
-    const lookaheadFraction = Math.min(0.14, (this.speed * 1.3) / trackLength);
-    const previewProgress = (this.progress + lookaheadFraction) % 1.0;
-    const upcomingCurvature = track.getPathCurvature(previewProgress);
-
-    const rawApex = Math.sqrt(42.0 / Math.max(0.0008, upcomingCurvature));
-    this.targetSpeed = Math.max(22.0, Math.min(94.0, rawApex));
-
-    let accelRate = 22.0;
-    if (this.speed < this.targetSpeed) {
-      this.speed = Math.min(this.targetSpeed, this.speed + accelRate * dt);
-    } else {
-      this.speed = Math.max(this.targetSpeed, this.speed - 36.0 * dt);
-    }
-
-    const isBraking = (this.targetSpeed < this.speed - 4.0);
-    const dProgress = (this.speed * dt) / trackLength;
-    this.progress = (this.progress + dProgress) % 1.0;
-
-    track.getPathPosition(this.progress, this.tempVec);
-    const heading = track.getTrajectoryHeading(this.progress);
-
-    const perpX = Math.cos(heading);
-    const perpZ = -Math.sin(heading);
-    this.car.carGroup.position.set(
-      this.tempVec.x + perpX * this.lateralOffset,
-      this.tempVec.y,
-      this.tempVec.z + perpZ * this.lateralOffset
-    );
-
-    let dRot = heading - this.car.carGroup.rotation.y;
-    while (dRot > Math.PI) dRot -= Math.PI * 2;
-    while (dRot < -Math.PI) dRot += Math.PI * 2;
-    this.car.carGroup.rotation.y += dRot * Math.min(1.0, 10.0 * dt);
-
-    this.car.updateVisuals(this.speed, (dRot / (dt + 0.001)) * 0.04, isBraking, dt);
   }
 }
 
@@ -3332,12 +3344,16 @@ class RacingGenesisApp {
     this.track.app = this;
     this.updateEnvironmentForTrack(this.track.getBoundingRadius(), this.track.totalLength);
     this.car = new RaceCar3D(this.scene);
+    this.previousRacePosition = new THREE.Vector3();
+    this.chasePosition = new THREE.Vector3();
+    this.savedCarPosition = new THREE.Vector3();
     this.cameraManager = new CameraManager3D(this.camera, this.renderer.domElement);
+    this.cameraManager.setTrack(this.track);
+    this.trackOverview = new TrackOverview($("trackOverviewCanvas"), $("trackOverviewLegend"));
     this.audio = new RacingEngineSound();
 
-    // Beta: Secondary Technical Pillars (Smoke/Skid Particles, Opponent AI, Oscilloscope Telemetry)
+    // Tire effects and telemetry
     this.tireSmokeSystem = new TireSmokeAndSkidSystem(this.scene);
-    this.opponent = new OpponentCarAgent(this.scene);
     this.telemetryGraph = new LiveTelemetryGraph("telemetryGraphCanvas");
     this.isOverCurb = false;
     this.prevSkidLeft = null;
@@ -3356,6 +3372,8 @@ class RacingGenesisApp {
     this.driverAI = new HeuristicNPCDriver();
     this.driverAI.startLap(1, this.track);
     this.state = "READY";
+    this.physicsAccumulator = 0;
+    this.manualLapDistance = 0;
     this.progress = 0;
     this.currentLap = 1;
     this.lapTime = 0;
@@ -3363,10 +3381,12 @@ class RacingGenesisApp {
     this.lateralG = 0;
     this.targetSpeed = 0;
     this.steerAngle = 0;
-    this.tireGrip = 1.15;
+    this.tireGrip = 1.10;
     this.totalLaps = 5;
     this.timeScale = 1;
     this.aiState = "IDLE";
+    this.currentRPM = 4500;
+    this.currentGear = 1;
     this.records = [];
     this.fastestRecord = null;
     this.throttleLevel = 0;
@@ -3388,12 +3408,12 @@ class RacingGenesisApp {
 
     // 6. Connect UI & Windows 11 Panel Drawer Controls
     this.bindUI();
+    this.reset();
 
     // Initial HUD & Dashboard Render
     this.updateHUD();
 
-    // 7. Start Animation Loop (Target 90 FPS High-Refresh Engine)
-    this.targetFPS = 90;
+    // 7. Start the display-synchronized render loop.
     this.startAnimationLoop();
   }
 
@@ -3402,7 +3422,11 @@ class RacingGenesisApp {
     this.scene.add(ambient);
 
     const sun = new THREE.DirectionalLight(0xfffbf2, 1.45);
-    sun.position.set(80, 110, 60);
+    this.sun = sun;
+    this.sunOffset = new THREE.Vector3(80, 110, 60);
+    this.shadowRight = new THREE.Vector3(this.sunOffset.z, 0, -this.sunOffset.x).normalize();
+    this.shadowUp = new THREE.Vector3().crossVectors(this.sunOffset, this.shadowRight).normalize();
+    sun.position.copy(this.sunOffset);
     sun.castShadow = true;
     sun.shadow.mapSize.width = 2048;
     sun.shadow.mapSize.height = 2048;
@@ -3413,7 +3437,7 @@ class RacingGenesisApp {
     sun.shadow.camera.top = 120;
     sun.shadow.camera.bottom = -120;
     sun.shadow.bias = -0.0004;
-    this.scene.add(sun);
+    this.scene.add(sun, sun.target);
   }
 
   setupRealisticWorld() {
@@ -3441,25 +3465,9 @@ class RacingGenesisApp {
   updateEnvironmentForTrack(boundingRadius, trackLength) {
     if (!this.treeGroup || !this.mountainGroup) return;
 
-    // Clear previous dynamic trees and mountains
-    while (this.treeGroup.children.length > 0) {
-      const c = this.treeGroup.children[0];
-      this.treeGroup.remove(c);
-      if (c.geometry) c.geometry.dispose();
-      if (c.material) {
-        if (Array.isArray(c.material)) c.material.forEach((m) => m.dispose());
-        else c.material.dispose();
-      }
-    }
-    while (this.mountainGroup.children.length > 0) {
-      const c = this.mountainGroup.children[0];
-      this.mountainGroup.remove(c);
-      if (c.geometry) c.geometry.dispose();
-      if (c.material) {
-        if (Array.isArray(c.material)) c.material.forEach((m) => m.dispose());
-        else c.material.dispose();
-      }
-    }
+    disposeGroupContents(this.treeGroup);
+    disposeGroupContents(this.mountainGroup);
+    if (this.cameraManager && !this.isDraggingHandle) this.cameraManager.setTrack(this.track);
 
     const trackR = Math.max(160, boundingRadius || 400);
 
@@ -3564,9 +3572,8 @@ class RacingGenesisApp {
 
     const togglePanel = (panel, btn) => {
       if (!panel) return;
-      panel.classList.toggle("collapsed");
-      const isCollapsed = panel.classList.contains("collapsed");
-      if (btn) btn.classList.toggle("active", !isCollapsed);
+      this.setDrawerCollapsed(panel, btn, !panel.classList.contains("collapsed"));
+      if (this.cameraManager.isTrackOrbit) this.cameraManager.fitTrack();
     };
 
     if (btnToggleLeft) btnToggleLeft.addEventListener("click", () => togglePanel(leftPanel, btnToggleLeft));
@@ -3581,18 +3588,6 @@ class RacingGenesisApp {
     });
 
     // Beta Feature Toggles
-    const btnToggleOpponent = $("btnToggleOpponent");
-    if (btnToggleOpponent) {
-      btnToggleOpponent.addEventListener("click", () => {
-        if (!this.opponent) return;
-        this.opponent.enabled = !this.opponent.enabled;
-        btnToggleOpponent.classList.toggle("active", this.opponent.enabled);
-        btnToggleOpponent.textContent = this.opponent.enabled ? "🏎️ AI Sparring Car: ON" : "🏎️ AI Sparring Car: OFF";
-        const pill = $("opponentGapPill");
-        if (pill) pill.style.display = this.opponent.enabled ? "" : "none";
-      });
-    }
-
     const btnToggleFX = $("btnToggleFX");
     if (btnToggleFX) {
       btnToggleFX.addEventListener("click", () => {
@@ -3608,12 +3603,11 @@ class RacingGenesisApp {
 
     // Camera Switcher
     document.querySelectorAll(".cam-btn").forEach((btn) => {
-      btn.addEventListener("click", () => {
-        document.querySelectorAll(".cam-btn").forEach((b) => b.classList.remove("active"));
-        btn.classList.add("active");
-        this.cameraManager.setMode(btn.dataset.cam);
-      });
+      btn.addEventListener("click", () => this.setCamera(btn.dataset.cam));
     });
+    $("btnAerialFollow").addEventListener("click", () => this.setCamera("aerial"));
+    $("btnAerialCircuit").addEventListener("click", () => this.setCamera("orbit"));
+    $("btnAerialMap").addEventListener("click", () => this.setCamera("map"));
 
     // Sliders & Track Length (1,000m - 10,000m)
     const syncOut = () => {
@@ -3640,10 +3634,8 @@ class RacingGenesisApp {
     if (lengthInput) {
       lengthInput.addEventListener("input", (e) => {
         let val = parseInt(e.target.value, 10);
-        if (isNaN(val)) return;
-        val = Math.max(1000, Math.min(10000, val));
+        if (isNaN(val) || val < 1000 || val > 10000) return;
         $("scaleSlider").value = val;
-        syncOut();
       });
       lengthInput.addEventListener("change", (e) => {
         let val = parseInt(e.target.value, 10);
@@ -3662,37 +3654,33 @@ class RacingGenesisApp {
     });
 
     $("btnRebuild").addEventListener("click", () => {
+      this.tireGrip = Number($("gripSlider").value);
       this.track.roadWidth = Number($("widthSlider").value);
       this.track.curveStrength = Number($("curveSlider").value);
       this.track.initControlPoints();
+      this.track.build3DHandles();
       this.track.scaleTrackToTargetLength(Number($("scaleSlider").value));
-      this.tireGrip = Number($("gripSlider").value);
       this.reset();
     });
 
     // F1 Circuit Presets
-    document.querySelectorAll(".f1-preset-pill").forEach((btn) => {
+    document.querySelectorAll("#f1PresetContainer .f1-preset-pill").forEach((btn) => {
       btn.addEventListener("click", () => {
-        document.querySelectorAll(".f1-preset-pill").forEach((b) => b.classList.remove("active"));
+        document.querySelectorAll("#f1PresetContainer .f1-preset-pill").forEach((b) => b.classList.remove("active"));
         btn.classList.add("active");
         this.track.loadF1Preset(btn.dataset.preset);
-        this.reset();
       });
     });
 
     $("btnRandomize").addEventListener("click", () => {
       this.track.randomize();
+      document.querySelectorAll("#f1PresetContainer .f1-preset-pill").forEach(btn => btn.classList.remove("active"));
       this.reset();
     });
 
     $("btnEditHandles").addEventListener("click", () => {
       this.track.toggleEditHandles();
-      if (this.track.editHandlesVisible && this.cameraManager.mode === "chase") {
-        document.querySelectorAll(".cam-btn").forEach((b) => b.classList.remove("active"));
-        const orbitBtn = document.querySelector('.cam-btn[data-cam="orbit"]');
-        if (orbitBtn) orbitBtn.classList.add("active");
-        this.cameraManager.setMode("orbit");
-      }
+      if (this.track.editHandlesVisible && this.cameraManager.mode !== "orbit") this.setCamera("orbit");
     });
 
     // Stress testing buttons
@@ -3707,6 +3695,7 @@ class RacingGenesisApp {
 
     $("btnStressCurve").addEventListener("click", () => {
       this.track.setHairpinStress();
+      document.querySelectorAll("#f1PresetContainer .f1-preset-pill").forEach(btn => btn.classList.remove("active"));
       this.reset();
     });
 
@@ -3719,10 +3708,6 @@ class RacingGenesisApp {
         if (isNaN(val) || val < 1) val = 1;
         lapInput.value = val;
         this.totalLaps = val;
-        if (this.state === "COMPLETE" && this.currentLap <= this.totalLaps) {
-          this.state = "READY";
-          setElText("simStateText", "READY");
-        }
         this.updateHUD();
       };
       lapInput.addEventListener("change", handleLapCommit);
@@ -3743,7 +3728,7 @@ class RacingGenesisApp {
     });
 
     $("btnStart").addEventListener("click", () => this.start());
-    $("btnPause").addEventListener("click", () => this.pause());
+    $("btnPause").addEventListener("click", () => this.togglePause());
     $("btnReset").addEventListener("click", () => this.reset());
 
     $("btnAudio").addEventListener("click", () => {
@@ -3754,7 +3739,15 @@ class RacingGenesisApp {
 
     // In-Simulation Driver Mode Switchers (Header Segmented & Left Panel)
     const setDriverMode = (mode) => {
+      const previousMode = this.driverMode;
       this.driverMode = mode;
+      this.previousRaceProgress = null;
+      this.currentAccel = 0;
+      this.steerAngle = 0;
+      this.isOverCurb = false;
+      this.car.carGroup.rotation.z = 0;
+      if (mode === "ai") this.speed = Math.max(0, this.speed);
+      if (mode === "manual" && previousMode !== "manual") this.manualLapDistance = this.progress;
       if (mode === "manual" && this.car) {
         this.manualHeading = this.car.carGroup.rotation.y;
       }
@@ -3779,84 +3772,50 @@ class RacingGenesisApp {
     });
 
     // Pause Modal Buttons
-    const btnResumeRace = $("btnResumeRace");
-    if (btnResumeRace) {
-      btnResumeRace.addEventListener("click", () => {
-        this.hidePauseMenu();
-        this.start();
-      });
-    }
+    $("btnResumeRace").addEventListener("click", () => this.resume());
+    $("btnRestartRace").addEventListener("click", () => {
+      if (this.state !== "PAUSED" || !$("pauseModal").open) return;
+      this.reset();
+      this.start();
+    });
+    $("pauseModal").addEventListener("cancel", (e) => {
+      e.preventDefault();
+      this.resume();
+    });
 
-    const btnRestartRace = $("btnRestartRace");
-    if (btnRestartRace) {
-      btnRestartRace.addEventListener("click", () => {
-        this.hidePauseMenu();
-        const curLen = Math.round(this.track.totalLength || 5000);
-        this.track.targetLength = curLen;
-        const sSlider = $("scaleSlider");
-        const sInput = $("lengthInput");
-        const sOut = $("scaleOut");
-        if (sSlider) sSlider.value = curLen;
-        if (sInput) sInput.value = curLen;
-        if (sOut) sOut.value = `${curLen.toLocaleString()} m (${(curLen / 1000).toFixed(2)} km)`;
-        const sLenDisp = $("trackLengthDisplay");
-        if (sLenDisp) sLenDisp.textContent = `${curLen.toLocaleString()} m`;
-        this.reset();
-        this.start();
-      });
-    }
-
-    // Finish Modal Buttons
-    const btnFinishRestart = $("btnFinishRestart");
-    if (btnFinishRestart) {
-      btnFinishRestart.addEventListener("click", () => {
-        this.hideFinishScreen();
-        const curLen = Math.round(this.track.totalLength || 5000);
-        this.track.targetLength = curLen;
-        const sSlider = $("scaleSlider");
-        const sInput = $("lengthInput");
-        const sOut = $("scaleOut");
-        if (sSlider) sSlider.value = curLen;
-        if (sInput) sInput.value = curLen;
-        if (sOut) sOut.value = `${curLen.toLocaleString()} m (${(curLen / 1000).toFixed(2)} km)`;
-        const sLenDisp = $("trackLengthDisplay");
-        if (sLenDisp) sLenDisp.textContent = `${curLen.toLocaleString()} m`;
-        this.reset();
-        this.start();
-      });
-    }
+    $("btnFinishRestart").addEventListener("click", () => {
+      if (this.state === "COMPLETE" && $("finishModal").open) this.start();
+    });
+    $("finishModal").addEventListener("cancel", (e) => e.preventDefault());
 
     const btnFinishSandbox = $("btnFinishSandbox");
     if (btnFinishSandbox) {
       btnFinishSandbox.addEventListener("click", () => {
+        if (this.state !== "COMPLETE" || !$("finishModal").open) return;
         this.hideFinishScreen();
         this.track.toggleEditHandles();
+        if (this.track.editHandlesVisible) this.setCamera("orbit");
       });
     }
 
     // Keyboard Shortcuts
     window.addEventListener("keydown", (e) => {
+      if (e.key === "Escape" || e.code === "Escape") {
+        e.preventDefault();
+        if (!e.repeat) this.togglePause();
+        return;
+      }
+      if (/^(INPUT|SELECT|TEXTAREA)$/.test(e.target?.tagName)) return;
+      if (["ArrowUp", "ArrowDown", "ArrowLeft", "ArrowRight"].includes(e.code)) e.preventDefault();
       this.keysDown[e.code] = true;
       if (this.driverMode === "manual" && this.state === "READY") {
         if (e.code === "KeyW" || e.code === "ArrowUp" || e.code === "KeyS" || e.code === "ArrowDown") {
           this.start();
         }
       }
-      if (e.code === "Escape") {
-        if ($("finishModal") && $("finishModal").classList.contains("active")) return;
-        const isPaused = $("pauseModal") && $("pauseModal").classList.contains("active");
-        if (isPaused) {
-          this.hidePauseMenu();
-          this.start();
-        } else {
-          this.showPauseMenu();
-        }
-      } else if (e.code === "KeyC") {
-        const nextCam = this.cameraManager.mode === "chase" ? "hood" : "chase";
-        this.cameraManager.setMode(nextCam);
-        document.querySelectorAll(".cam-btn").forEach((b) => {
-          b.classList.toggle("active", b.dataset.cam === nextCam);
-        });
+      if (e.code === "KeyC") {
+        const current = this.cameraManager.mode;
+        this.setCamera(current === "chase" ? "hood" : current === "hood" ? "aerial" : "chase");
       } else if (e.code === "KeyM") {
         const on = this.audio.toggle();
         $("btnAudio").textContent = on ? "🔊 Audio: ON" : "🔊 Audio: OFF";
@@ -3868,16 +3827,61 @@ class RacingGenesisApp {
       this.keysDown[e.code] = false;
     });
 
+    window.addEventListener("blur", () => {
+      this.keysDown = {};
+      this.pause();
+    });
+    document.addEventListener("visibilitychange", () => {
+      if (document.hidden) this.pause();
+    });
     this.setupHandleInteractions();
 
     window.addEventListener("resize", () => {
       this.camera.aspect = window.innerWidth / window.innerHeight;
       this.camera.updateProjectionMatrix();
       this.renderer.setSize(window.innerWidth, window.innerHeight);
+      this.cameraManager.fitTrack(1, true);
     });
 
     syncOut();
     this.updateHUD();
+  }
+
+  setDrawerCollapsed(panel, button, collapsed) {
+    panel.classList.toggle("collapsed", collapsed);
+    button?.classList.toggle("active", !collapsed);
+    button?.setAttribute("aria-expanded", String(!collapsed));
+    panel.inert = collapsed;
+  }
+
+  setCamera(mode) {
+    if (this.cameraManager.mode !== mode) this.previousRaceProgress = null;
+    const circuitShot = mode === "orbit" && !this.track.editHandlesVisible;
+    if (circuitShot && !this.circuitDrawers) {
+      this.circuitDrawers = [[$("leftPanel"), $("btnToggleLeft")], [$("rightPanel"), $("btnToggleRight")]]
+        .map(([panel, button]) => {
+          const collapsed = panel.classList.contains("collapsed");
+          this.setDrawerCollapsed(panel, button, true);
+          return { panel, button, collapsed };
+        });
+    } else if (!circuitShot && this.circuitDrawers) {
+      for (const { panel, button, collapsed } of this.circuitDrawers) {
+        this.setDrawerCollapsed(panel, button, collapsed);
+      }
+      this.circuitDrawers = null;
+    }
+    this.cameraManager.setMode(mode);
+    $("liveDeltaBadge").hidden = circuitShot;
+    const headerMode = this.cameraManager.isAerialView ? "aerial" : mode;
+    document.querySelectorAll(".cam-btn").forEach(btn => {
+      const active = btn.dataset.cam === headerMode;
+      btn.classList.toggle("active", active);
+      btn.setAttribute("aria-pressed", String(active));
+    });
+    $("aerialControls").hidden = !this.cameraManager.isAerialView;
+    $("btnAerialFollow").setAttribute("aria-pressed", String(mode === "aerial"));
+    $("btnAerialCircuit").setAttribute("aria-pressed", String(mode === "orbit"));
+    $("btnAerialMap").setAttribute("aria-pressed", String(mode === "map"));
   }
 
   setupHandleInteractions() {
@@ -3960,6 +3964,7 @@ class RacingGenesisApp {
         this.isDraggingHandle = false;
         this.activeHandleIndex = null;
         this.cameraManager.locked = false;
+        this.cameraManager.setTrack(this.track);
         this.renderer.domElement.style.cursor = "default";
         const curLen = Math.round(this.track.totalLength || 5000);
         this.track.targetLength = curLen;
@@ -3980,12 +3985,13 @@ class RacingGenesisApp {
   }
 
   start() {
+    if (this.state === "PAUSED") return this.resume();
     if (this.state === "COMPLETE") this.reset();
-    if (this.state === "RUNNING") return;
-    if (this.state === "COUNTDOWN") return;
+    if (this.state !== "READY") return;
 
     // F1 Signal Lights Starting Countdown: Red 1..5 -> Blinking Red -> Green (GO!)
     this.state = "COUNTDOWN";
+    this.updatePauseControl();
     this.countdownTimer = 0;
     this.speed = 0;
     this.currentAccel = 0;
@@ -4021,11 +4027,9 @@ class RacingGenesisApp {
         this.greenTimer = 3.2; // Keep green lights shining for 3.2s
         setElText("simStateText", "RUNNING");
         this.aiState = "LAUNCH ACCELERATION";
-        if (this.audio) {
-          this.audio.start();
-        }
+        // Audio is enabled only by the explicit audio button/user gesture.
       }
-    } else if (this.greenTimer > 0) {
+    } else if (this.state !== "PAUSED" && this.greenTimer > 0) {
       this.greenTimer -= dt;
       if (this.greenTimer <= 0) {
         if (this.track) this.track.setGantryLights("OFF");
@@ -4065,22 +4069,57 @@ class RacingGenesisApp {
     }
   }
 
-  pause() {
-    if (this.state === "RUNNING") {
-      this.state = "PAUSED";
-      setElText("simStateText", "PAUSED");
-    }
+  togglePause() {
+    if (this.state === "PAUSED") this.resume();
+    else this.pause();
   }
 
-  showPauseMenu() {
-    this.pause();
+  pause() {
+    if (!["RUNNING", "COUNTDOWN", "CELEBRATION", "RESUMING"].includes(this.state)) return;
+    if (this.state !== "RESUMING") this.resumeState = this.state;
+    $("resumeCountdown").hidden = true;
+    this.state = "PAUSED";
+    this.keysDown = {};
     const modal = $("pauseModal");
-    if (modal) modal.classList.add("active");
+    if (!modal.open) modal.showModal();
+    this.updatePauseControl();
+    $("btnResumeRace")?.focus?.({ preventScroll: true });
+  }
+
+  resume() {
+    if (this.state !== "PAUSED") return;
+    this.state = "RESUMING";
+    this.resumeTimeRemaining = 3;
+    this.hidePauseMenu();
+    setElText("resumeSeconds", "3");
+    $("resumeCountdown").hidden = false;
+    $("btnPause")?.focus?.({ preventScroll: true });
+  }
+
+  updateResumeCountdown(dt) {
+    if (this.state !== "RESUMING") return;
+    this.resumeTimeRemaining -= dt;
+    const seconds = Math.ceil(this.resumeTimeRemaining - 1e-9);
+    if (seconds > 0) {
+      const label = $("resumeSeconds");
+      if (label.textContent !== String(seconds)) label.textContent = String(seconds);
+      return;
+    }
+    this.state = this.resumeState;
+    this.resumeState = null;
+    $("resumeCountdown").hidden = true;
+    this.updatePauseControl();
   }
 
   hidePauseMenu() {
     const modal = $("pauseModal");
-    if (modal) modal.classList.remove("active");
+    if (modal.open) modal.close();
+  }
+
+  updatePauseControl() {
+    const canStart = this.state === "READY" || this.state === "COMPLETE";
+    $("btnStart").disabled = !canStart;
+    $("btnPause").disabled = canStart;
   }
 
   showFinishScreen() {
@@ -4108,21 +4147,48 @@ class RacingGenesisApp {
             <td><b>${r.time.toFixed(2)}s</b></td>
             <td style="color:${r.delta <= 0 ? '#00e676' : '#ffaa00'}">${r.delta <= 0 ? 'PB' : '+' + r.delta.toFixed(2) + 's'}</td>
             <td>${r.strategy || 'Balanced'}</td>
-            <td style="color:#00e676">✓ 100% Clean</td>
+            <td>${r.clean ? "Clean" : "Off track"}</td>
           </tr>
         `).join("");
       }
     }
 
-    modal.classList.add("active");
+    if (!modal.open) modal.showModal();
   }
 
   hideFinishScreen() {
     const modal = $("finishModal");
-    if (modal) modal.classList.remove("active");
+    if (modal?.open) modal.close();
   }
 
   reset() {
+    this.resumeState = null;
+    this.resumeTimeRemaining = 0;
+    $("resumeCountdown").hidden = true;
+    this.finishDelay = 0;
+    this.physicsAccumulator = 0;
+    this.previousRaceProgress = null;
+    this.manualLapDistance = 0;
+    this.lapClean = true;
+    this.keysDown = {};
+    this.isOverCurb = false;
+    this.prevSkidLeft = this.prevSkidRight = null;
+    this.hidePauseMenu();
+    this.hideFinishScreen();
+    $("brakingWarning")?.classList.remove("visible");
+    this.tireSmokeSystem?.clear();
+    if (this.telemetryGraph?.ctx) {
+      for (const key of ["speedHistory", "throttleHistory", "brakeHistory", "latGHistory"]) this.telemetryGraph[key].fill(0);
+      this.telemetryGraph.head = 0;
+    }
+    if (this.car) {
+      this.car.brakeHeat = 0;
+      this.car.carGroup.rotation.z = 0;
+      this.car.chassisMesh.rotation.set(0, 0, 0);
+      this.car.frontWheelSteerGroups.forEach(wheel => wheel.rotation.y = 0);
+      this.car.steeringWheelMesh.rotation.z = 0;
+      this.car.updateVisuals(0, 0, false, 0);
+    }
     this.state = "READY";
     this.countdownTimer = 0;
     this.greenTimer = 0;
@@ -4142,6 +4208,8 @@ class RacingGenesisApp {
     this.brakeLevel = 0;
     this.currentAccel = 0;
     this.aiState = "IDLE";
+    this.currentRPM = 4500;
+    this.currentGear = 1;
     this.records = [];
     this.fastestRecord = null;
     this.driverAI.reset();
@@ -4157,6 +4225,7 @@ class RacingGenesisApp {
       this.cameraManager.cameraInitialized = false;
     }
 
+    this.updatePauseControl();
     setElText("simStateText", "READY");
     const deltaVal = $("liveDeltaVal");
     if (deltaVal) {
@@ -4167,15 +4236,21 @@ class RacingGenesisApp {
   }
 
   updatePhysics(dtWall) {
-    if (this.state !== "RUNNING" && this.state !== "CELEBRATION") return;
-
-    // Direct synchronous frame-rate independent physics integration
-    const dt = Math.min(dtWall, 0.04) * this.timeScale;
-    if (this.driverMode === "manual") {
-      this.stepManualPhysics(dt);
-    } else {
-      this.stepPhysics(dt);
+    if (this.state !== "RUNNING") return;
+    this.physicsAccumulator += Math.min(Math.max(dtWall, 0), 0.25) * this.timeScale;
+    // Allow for frame deltas that sum to one tick within floating-point error.
+    while (this.physicsAccumulator + 1e-9 >= PHYSICS_STEP && this.state === "RUNNING") {
+      this.previousRaceProgress = this.progress;
+      if (this.driverMode === "manual") {
+        this.previousRacePosition.copy(this.car.carGroup.position);
+        this.previousRaceYaw = this.car.carGroup.rotation.y;
+        this.stepManualPhysics(PHYSICS_STEP);
+      } else {
+        this.stepPhysics(PHYSICS_STEP);
+      }
+      this.physicsAccumulator = Math.max(0, this.physicsAccumulator - PHYSICS_STEP);
     }
+    if (this.state !== "RUNNING") this.physicsAccumulator = 0;
   }
 
   stepManualPhysics(dt) {
@@ -4276,17 +4351,21 @@ class RacingGenesisApp {
     this.lapTime += dt;
 
     // Beta: Curb and Off-Track Boundaries Detection
-    const nearestSample = this.track.getSampleAt(this.progress);
-    const distToCenter = nearestSample.position.distanceTo(this.car.carGroup.position);
+    this.track.curve.getPointAt(this.progress, _pCurr);
+    this.track.curve.getTangentAt(this.progress, _scratchTangent);
+    _scratchNormal.set(-_scratchTangent.z, 0, _scratchTangent.x).normalize();
+    const distToCenter = Math.abs(_vA.subVectors(this.car.carGroup.position, _pCurr).dot(_scratchNormal));
+    this.car.carGroup.rotation.z = 0;
     const roadHalf = this.track.roadWidth * 0.5;
 
     if (distToCenter > (roadHalf - 0.7) && distToCenter < (roadHalf + 0.85)) {
       this.isOverCurb = true;
       this.car.carGroup.position.y = 0.05 + Math.sin(performance.now() * 0.065) * 0.035;
-      this.car.carGroup.rotation.z += (Math.random() - 0.5) * 0.015;
+      this.car.carGroup.rotation.z = Math.sin(performance.now() * 0.065) * 0.008;
     } else if (distToCenter >= (roadHalf + 0.85)) {
+      this.lapClean = false;
       this.isOverCurb = false;
-      this.speed = Math.max(0, this.speed - 34.0 * dt);
+      this.speed = Math.sign(this.speed) * Math.max(0, Math.abs(this.speed) - 34.0 * dt);
       if (this.tireSmokeSystem && Math.abs(this.speed) > 4) {
         this.tireSmokeSystem.emitSmoke(this.car.carGroup.position, new THREE.Vector3(0, 0, 0), 1.6);
       }
@@ -4295,107 +4374,55 @@ class RacingGenesisApp {
     }
 
     // Lateral G estimation
-    const turnD = this.steerAngle * this.speed;
-    this.lateralG = (turnD * this.speed) / (G_ACCEL * 12.0);
+    const yawRate = Math.abs(this.steerAngle) > 0.02 ? this.steerAngle * turnRate * steerDir : 0;
+    this.lateralG = this.speed * yawRate / G_ACCEL;
     this.maxSessionG = Math.max(this.maxSessionG || 0, Math.abs(this.lateralG));
 
     // Lap crossing detection (crossing start/finish line in forward direction)
-    if (prevProgress > 0.82 && this.progress < 0.18 && this.speed > 0) {
+    let advance = this.progress - prevProgress;
+    if (advance > 0.5) advance -= 1;
+    if (advance < -0.5) advance += 1;
+    this.manualLapDistance = Math.max(0, (this.manualLapDistance || 0) + advance);
+    if (prevProgress > 0.82 && this.progress < 0.18 && this.speed > 0 && this.manualLapDistance > 0.95) {
+      this.manualLapDistance = 0;
       this.completeLap();
     }
   }
 
   stepPhysics(dt) {
-    const params = this.driverAI.currentParams;
-    const currSample = this.track.getSampleAt(this.progress);
     const trackLength = this.track.totalLength || (520 * this.track.lengthScale);
 
-    // 1. Authentic F1 Aerodynamic Downforce:
-    // Generates massive 4.5G - 5.2G cornering grip at high speeds
-    const speedRatio = this.speed / 26.0;
-    const downforceFactor = 1.0 + Math.min(4.4, speedRatio * speedRatio * 0.52);
-    const aeroGrip = Math.min(54.0, this.tireGrip * G_ACCEL * downforceFactor);
-
-    // 2. Curvature Lookahead & Target Apex Speed:
-    const lookaheadSec = 1.4; // 1.4s preview distance
-    const lookaheadMeters = Math.max(32.0, this.speed * lookaheadSec);
-    const lookaheadFraction = Math.min(0.18, lookaheadMeters / trackLength);
-    const previewProgress = (this.progress + lookaheadFraction) % 1;
-
-    const upcomingCurvature = this.track.getPathCurvature(previewProgress);
-    const currPathCurvature = this.track.getPathCurvature(this.progress);
-
-    // Safe apex speed from centripetal physics: v = sqrt(aeroGrip / kappa)
-    const rawApexSpeed = Math.sqrt(aeroGrip / Math.max(0.0007, upcomingCurvature)) * (params.apexCarryFactor || 1.0);
-    const minSafeSpeed = 48 * MPH_TO_MS; // 48 mph hairpins
-    const maxStraightSpeed = 228 * MPH_TO_MS; // 228 mph (367 km/h) authentic F1 top speed
-    this.targetSpeed = Math.max(minSafeSpeed, Math.min(maxStraightSpeed, rawApexSpeed));
-
-    // 3. Lateral Acceleration & Kamm Friction Circle
-    const currLatG = (this.speed * this.speed * currPathCurvature) / G_ACCEL;
-    this.lateralG = currLatG;
-
-    // Beta: Autonomous Line Curb Contact
-    const pathOffset = this.driverAI.currentPathOffsets ? this.driverAI.currentPathOffsets[currSample.index] : 0;
-    const roadHalfAI = this.track.roadWidth * 0.5;
-    this.isOverCurb = Math.abs(pathOffset) > (roadHalfAI - 1.1);
-    const latAccelMs = currLatG * G_ACCEL;
-    const longGripBudget = Math.sqrt(Math.max(0, aeroGrip * aeroGrip - latAccelMs * latAccelMs));
-
-    // Natural tire scrub only bleeds speed when heavily loaded laterally in turns
-    const tireScrubDecel = Math.max(0, (currLatG - 2.0)) * 2.2 * (this.speed / (this.speed + 8.0));
-
-    // 4. Exact Kinematic Braking Point Calculation:
-    // How many meters needed to brake down to targetSpeed at 4.2G deceleration?
-    const stoppingDecel = 42.0; // 4.2G carbon brake deceleration
-    const speedDeltaSq = (this.speed * this.speed) - (this.targetSpeed * this.targetSpeed);
-    const requiredBrakingDist = speedDeltaSq > 0 ? speedDeltaSq / (2 * stoppingDecel) : 0;
-    const distToApex = lookaheadFraction * trackLength;
-
-    let targetAccel = 0;
-
-    if (requiredBrakingDist > 0 && distToApex <= requiredBrakingDist + 8.0) {
-      // THRESHOLD BRAKING: Arrived at braking point! Maximum stopping power
-      const reqDecel = speedDeltaSq / Math.max(4.0, 2 * distToApex);
-      const decel = Math.min(50.0, Math.max(20.0, reqDecel)); // Up to 5.0G peak braking
-      targetAccel = -decel;
+    const maxStraightSpeed = 228 * MPH_TO_MS;
+    const preview = this.progress + (8 + this.speed * 0.45) / trackLength;
+    this.targetSpeed = this.driverAI.getPlannedSpeed(preview, this.track);
+    const error = this.targetSpeed - this.speed;
+    let targetAccel;
+    if (error < -0.3) {
+      targetAccel = Math.max(-42, error * 4);
+      this.brakeLevel = Math.min(1, -targetAccel / 42);
+      this.throttleLevel = 0;
       this.aiState = "THRESHOLD BRAKING";
-      this.brakeLevel = Math.min(1.0, decel / 42.0);
-      this.throttleLevel = 0.0;
-      const bWarn = $("brakingWarning");
-      if (bWarn) bWarn.classList.add("visible");
-    } else if (currPathCurvature > 0.0045) {
-      // MID-CORNER APEX: Balance throttle and carry high corner speed
-      this.aiState = "APEX SPEED SETTLE";
-      targetAccel = (this.speed < this.targetSpeed ? 8.0 : -2.0) - tireScrubDecel;
-      this.brakeLevel = 0.0;
-      this.throttleLevel = 0.70;
-      const bWarn = $("brakingWarning");
-      if (bWarn) bWarn.classList.remove("visible");
     } else {
-      // FULL THROTTLE STRAIGHT: F1 rocket acceleration (1000+ HP hybrid power)
-      this.aiState = "FULL THROTTLE STRAIGHT";
-      const f1PunchAccel = Math.min(28.0, longGripBudget) * (params.exitThrottleAggression || 1.0);
-      // Ferocious continuous acceleration all the way to 220+ mph
-      targetAccel = f1PunchAccel * Math.max(0.26, 1.0 - Math.pow(this.speed / maxStraightSpeed, 1.15));
-      this.brakeLevel = 0.0;
-      this.throttleLevel = 1.0;
-      const bWarn = $("brakingWarning");
-      if (bWarn) bWarn.classList.remove("visible");
+      targetAccel = Math.min(26 * Math.max(0.22, 1 - (this.speed / maxStraightSpeed) ** 1.15), Math.max(0, error * 3));
+      this.brakeLevel = 0;
+      this.throttleLevel = Math.min(1, targetAccel / 12);
+      this.aiState = error > 2 ? "FULL THROTTLE STRAIGHT" : "APEX SPEED SETTLE";
     }
-
-    // 5. Responsive Jerk-Limited Acceleration
-    const maxJerk = 110.0; // Responsive F1 throttle & brake bite (m/s^3)
-    const maxAccelChange = maxJerk * dt;
-    this.currentAccel += THREE.MathUtils.clamp(targetAccel - this.currentAccel, -maxAccelChange, maxAccelChange);
-
-    // 6. Velocity Integration (0-60 in 2.2s, reaches 220+ mph on straights)
-    this.speed = Math.max(0, Math.min(maxStraightSpeed, this.speed + this.currentAccel * dt));
+    $("brakingWarning")?.classList.toggle("visible", this.brakeLevel > 0.05);
+    this.currentAccel += THREE.MathUtils.clamp(targetAccel - this.currentAccel, -110 * dt, 110 * dt);
+    // This kinematic driver stays on the spline. Enforce its planned grip limit
+    // instead of allowing impossible cornering loads without any tire slip.
+    const nextProgress = this.progress + (Math.max(0, this.speed) * dt) / trackLength;
+    const localLimit = Math.min(this.driverAI.getPlannedSpeed(this.progress, this.track), this.driverAI.getPlannedSpeed(nextProgress, this.track));
+    this.speed = Math.max(0, Math.min(localLimit, this.speed + this.currentAccel * dt));
+    const pathOffset = this.track.getLapOffset(this.progress);
+    this.isOverCurb = Math.abs(pathOffset) > this.track.roadWidth * 0.5 - 1.1;
+    this.lateralG = this.speed ** 2 * this.track.getPathCurvature(this.progress) / G_ACCEL;
     this.maxSessionSpeed = Math.max(this.maxSessionSpeed || 0, this.speed);
     this.maxSessionG = Math.max(this.maxSessionG || 0, Math.abs(this.lateralG));
 
     // 7. Steering Model (Autonomous AI)
-    const lookaheadDs = 0.012; // Preview ~7 meters ahead of the front wing for smooth anticipatory steering
+    const lookaheadDs = 7 / trackLength;
     const hCurr = this.track.getTrajectoryHeading(this.progress);
     const hAhead = this.track.getTrajectoryHeading(this.progress + lookaheadDs);
     let dHeading = hAhead - hCurr;
@@ -4420,10 +4447,13 @@ class RacingGenesisApp {
   }
 
   completeLap() {
+    if (this.state !== "RUNNING") return;
     // Vigorously wave the left-side finish line flag at the end of every lap!
     this.flagCelebrationTimer = 8.0;
 
     const record = this.driverAI.evaluateLap(this.lapTime);
+    record.clean = this.lapClean !== false;
+    this.lapClean = true;
     this.records.push(record);
 
     if (record.isPB) {
@@ -4434,11 +4464,11 @@ class RacingGenesisApp {
       this.state = "CELEBRATION";
       this.aiState = "VICTORY! LAP COMPLETE 🏁";
       setElText("simStateText", "FINISHED 🏁");
-      // Allow player to watch the waving checkered flag and celebrating crowd before popup
-      setTimeout(() => {
-        this.state = "COMPLETE";
-        this.showFinishScreen();
-      }, 4500);
+      this.progress = ((this.progress % 1) + 1) % 1;
+      this.speed = 0;
+      this.currentAccel = 0;
+      this.throttleLevel = this.brakeLevel = 0;
+      this.finishDelay = 4.5;
     } else {
       this.currentLap += 1;
       this.progress = ((this.progress % 1) + 1) % 1;
@@ -4453,10 +4483,12 @@ class RacingGenesisApp {
     const speedMph = Math.round(this.speed * MS_TO_MPH);
     const speedKmh = Math.round(this.speed * 3.6);
 
-    // Compute F1 Transmission & RPM continuously (independent of audio state)
-    const trans = computeF1Transmission(speedMph);
-    this.currentGear = trans.gear;
-    this.currentRPM = THREE.MathUtils.lerp(this.currentRPM || 4500, trans.rpm, 0.22);
+    // Keep the transmission readout at the paused value until the race resumes.
+    if (this.resumeState === null) {
+      const trans = computeF1Transmission(speedMph);
+      this.currentGear = trans.gear;
+      this.currentRPM = THREE.MathUtils.lerp(this.currentRPM || 4500, trans.rpm, 0.22);
+    }
 
     // Standard sidebar HUD
     const spdEl = $("speedDisplay");
@@ -4504,7 +4536,7 @@ class RacingGenesisApp {
     const brakeMeter = $("brakeMeter");
     if (brakeMeter) brakeMeter.style.width = `${Math.round(this.brakeLevel * 100)}%`;
     const apexMeter = $("apexMeter");
-    if (apexMeter) apexMeter.style.width = `${Math.min(100, Math.round((this.lateralG / (this.tireGrip * 3.8)) * 100))}%`;
+    if (apexMeter) apexMeter.style.width = `${Math.min(100, Math.round((Math.abs(this.lateralG) / (this.tireGrip * 3.8)) * 100))}%`;
     const throttleMeter = $("throttleMeter");
     if (throttleMeter) throttleMeter.style.width = `${Math.round(this.throttleLevel * 100)}%`;
 
@@ -4569,53 +4601,79 @@ class RacingGenesisApp {
   }
 
   startAnimationLoop() {
-    this.targetFPS = 90;
-    this.minFrameIntervalMs = 1000 / (this.targetFPS + 1); // ~10.98ms minimum frame pacing
-    this.lastFrameTime = performance.now();
-    this.lastStepTime = performance.now();
-
-    const tick = () => {
-      const now = performance.now();
-      const elapsed = now - this.lastFrameTime;
-      if (elapsed < this.minFrameIntervalMs) return;
-
-      const dt = Math.min((now - this.lastStepTime) / 1000, 0.033);
-      this.lastFrameTime = now;
-      this.lastStepTime = now;
-
+    let previousFrame;
+    const renderFrame = (now) => {
+      const dt = previousFrame === undefined ? 0 : Math.min((now - previousFrame) / 1000, 0.25);
+      previousFrame = now;
+      this.rafId = requestAnimationFrame(renderFrame);
       this.stepFrame(dt);
     };
-
-    // V-Sync alignment for displays (60Hz, 90Hz, 120Hz, 144Hz+)
-    const rAFLoop = () => {
-      this.rafId = requestAnimationFrame(rAFLoop);
-      tick();
-    };
-    this.rafId = requestAnimationFrame(rAFLoop);
+    this.rafId = requestAnimationFrame(renderFrame);
   }
 
   animate() {
     this.stepFrame(1 / 90);
   }
 
-  stepFrame(dt) {
-    // 1. Update Physics
-    this.updatePhysics(dt);
+  updateChasePose(frozen) {
+    const car = this.car.carGroup;
+    if (frozen && this.previousRaceProgress !== null) return;
+    this.chasePosition.copy(car.position);
+    this.chaseYaw = car.rotation.y;
+    if (this.state !== "RUNNING" || this.previousRaceProgress === null) return;
 
-    // 2. Update Start Signal Lights Countdown (Red -> Blinking Red -> Green)
-    this.updateStartCountdown(dt);
-
-    // 3. Update Left-Side Finish Line Waving Flag & Trackside Audience
-    if (this.flagCelebrationTimer > 0) {
-      this.flagCelebrationTimer -= dt;
+    // Draw between the last two fixed physics poses. Keep race state on the fixed clock.
+    const fraction = this.physicsAccumulator / PHYSICS_STEP;
+    if (this.driverMode === "manual") {
+      this.chasePosition.lerpVectors(this.previousRacePosition, car.position, fraction);
+      this.chaseYaw = THREE.MathUtils.lerp(this.previousRaceYaw, car.rotation.y, fraction);
+    } else {
+      const advance = (this.progress - this.previousRaceProgress + 1) % 1;
+      this.track.getPathPosition(this.previousRaceProgress + advance * fraction, this.chasePosition);
     }
-    if (this.track) {
-      this.track.updateFinishFlag(dt, this.progress, this.flagCelebrationTimer > 0);
-      this.track.updateAudience(dt);
+  }
+
+  renderChasePose() {
+    const car = this.car.carGroup;
+    this.savedCarPosition.copy(car.position);
+    const yaw = car.rotation.y;
+    car.position.copy(this.chasePosition);
+    car.rotation.y = this.chaseYaw;
+    try {
+      this.renderer.render(this.scene, this.camera);
+    } finally {
+      car.position.copy(this.savedCarPosition);
+      car.rotation.y = yaw;
+    }
+  }
+
+  stepFrame(dt) {
+    const frozen = this.state === "PAUSED" || this.state === "RESUMING";
+    if (!frozen) {
+      this.updatePhysics(dt);
+      this.updateStartCountdown(dt);
+      if (this.state === "CELEBRATION") {
+        this.finishDelay -= dt;
+        if (this.finishDelay <= 0) {
+          this.state = "COMPLETE";
+          this.updatePauseControl();
+          this.showFinishScreen();
+        }
+      }
+    }
+    const motionDt = this.state === "RUNNING" ? dt * this.timeScale : 0;
+
+    // 3. Update the finish flag and crowd on the session clock.
+    const sceneDt = frozen ? 0 : dt;
+    if (this.flagCelebrationTimer > 0) {
+      this.flagCelebrationTimer -= sceneDt;
+    }
+    if (sceneDt > 0) {
+      this.track.updateFinishFlag(sceneDt, this.progress, this.flagCelebrationTimer > 0);
     }
 
     // 4. In Autonomous AI mode, car position and heading follow the racing spline
-    if (this.driverMode !== "manual") {
+    if (!frozen && this.driverMode !== "manual") {
       this.track.getPathPosition(this.progress, this.car.carGroup.position);
 
       const targetHeading = this.track.getTrajectoryHeading(this.progress);
@@ -4632,18 +4690,49 @@ class RacingGenesisApp {
     }
 
     // 4. Update Car Wheel and Chassis Visuals
-    const isBraking = this.aiState.includes("BRAKING");
-    this.car.updateVisuals(this.speed, this.steerAngle, isBraking, dt);
+    const isBraking = this.brakeLevel > 0.05;
+    this.car.updateVisuals(this.speed, this.steerAngle, isBraking, motionDt);
 
     // 5. Update Braking Zone Overlay
-    this.track.updateBrakingZone(this.progress);
+    const showBrakingZone = this.cameraManager.mode !== "orbit";
+    this.track.brakingZoneMesh.visible = showBrakingZone;
+    if (showBrakingZone) this.track.updateBrakingZone(this.progress);
 
     // 6. Update Handle Scales
     this.track.updateHandleScales(this.camera);
 
     // 7. Update Camera (Chase camera locks directly behind car's actual forward chassis heading)
+    const isChase = this.cameraManager.mode === "chase";
+    let carPosition = this.car.carGroup.position;
     this.car.carGroup.getWorldDirection(_camForwardVec);
-    this.cameraManager.update(this.car.carGroup, _camForwardVec, this.speed, dt);
+    if (isChase) {
+      this.updateChasePose(frozen);
+      carPosition = this.chasePosition;
+      if (this.driverMode === "manual") _camForwardVec.set(Math.sin(this.chaseYaw), 0, Math.cos(this.chaseYaw));
+    }
+    const cameraDt = isChase && frozen ? 0 : dt;
+    this.cameraManager.update(this.car.carGroup, _camForwardVec, this.speed, cameraDt, this.track.editHandlesVisible, carPosition);
+    if (sceneDt > 0) this.track.crowd.update(sceneDt, this.camera.position);
+    // An overview can be several kilometers high; driving-distance haze would
+    // obscure the entire circuit even though it is correctly inside the frame.
+    const overhead = this.cameraManager.mode === "orbit" && this.cameraManager.orbitPhi > 1.3;
+    this.scene.fog.density = overhead ? 0 : this.cameraManager.isTrackOrbit
+      ? Math.min(0.00018, 0.25 / this.cameraManager.orbitDistance) : 0.00018;
+    this.trackOverview.draw(this.track, this.cameraManager);
+
+    // Move the shadow map with the car in whole light-space texels.
+    if (this.cameraManager.mode !== "map") {
+      const { camera, mapSize } = this.sun.shadow;
+      const texel = (camera.right - camera.left) / mapSize.x;
+      const target = this.sun.target.position.copy(carPosition).setY(0);
+      const across = target.dot(this.shadowRight);
+      const up = target.dot(this.shadowUp);
+      target.addScaledVector(this.shadowRight, Math.round(across / texel) * texel - across);
+      target.addScaledVector(this.shadowUp, Math.round(up / texel) * texel - up);
+    } else {
+      this.sun.target.position.set(0, 0, 0);
+    }
+    this.sun.position.copy(this.sun.target.position).add(this.sunOffset);
 
     // Driver helmet & Halo central pillar visibility: hide in Cockpit 3D POV so track and road ahead are completely unobstructed
     const isCockpit = (this.cameraManager.mode === "hood");
@@ -4655,17 +4744,13 @@ class RacingGenesisApp {
       this.car.haloStrut.visible = !isCockpit;
     }
 
-    // Beta: Update Opponent AI & Particle System
-    if (this.opponent) {
-      this.opponent.update(dt, this.track, this.progress, this.speed);
-    }
     if (this.tireSmokeSystem) {
-      this.tireSmokeSystem.update(dt, this.camera);
+      this.tireSmokeSystem.update(motionDt, this.camera);
     }
 
     // Dynamic Tire Smoke & Skidmarks under heavy braking / slip
     const isSlipping = (isBraking && Math.abs(this.speed) > 6.0) || (Math.abs(this.lateralG) > 2.2 && Math.abs(this.speed) > 16.0);
-    if (isSlipping && this.tireSmokeSystem && this.tireSmokeSystem.enabled) {
+    if (motionDt > 0 && isSlipping && this.tireSmokeSystem && this.tireSmokeSystem.enabled) {
       const carPos = this.car.carGroup.position;
       const carRot = this.car.carGroup.rotation.y;
       const cosR = Math.cos(carRot);
@@ -4693,27 +4778,17 @@ class RacingGenesisApp {
       this.prevSkidRight = null;
     }
 
+    if (this.audio.ctx && this.audio.enabled) {
+      this.audio.masterGain.gain.setTargetAtTime(frozen ? 0 : 0.08, this.audio.ctx.currentTime, 0.05);
+    }
     // 8. Update Audio Synthesizer (in sync with live RPM, Gear and Curb Vibration)
     if (this.audio) {
       const speedMph = this.speed * MS_TO_MPH;
       this.audio.update(speedMph, isBraking, this.throttleLevel, this.currentRPM, this.currentGear, this.isOverCurb);
     }
 
-    // Beta: Update Opponent Gap & Oscilloscope Telemetry Trace
-    if (this.opponent && this.opponent.enabled) {
-      let deltaProg = this.opponent.progress - this.progress;
-      while (deltaProg > 0.5) deltaProg -= 1.0;
-      while (deltaProg < -0.5) deltaProg += 1.0;
-      const distMeters = deltaProg * (this.track ? this.track.totalLength : 5000);
-      const gapSec = distMeters / Math.max(12, Math.abs(this.speed));
-      const gapDisp = $("opponentGapDisplay");
-      if (gapDisp) {
-        gapDisp.textContent = (gapSec >= 0 ? "+" : "") + gapSec.toFixed(2) + "s";
-        gapDisp.style.color = (gapSec >= 0 ? "#ff4444" : "#10b981");
-      }
-    }
     if (this.telemetryGraph) {
-      this.telemetryGraph.record(
+      if (motionDt > 0) this.telemetryGraph.record(
         Math.abs(this.speed) / 98.0,
         this.throttleLevel,
         this.brakeLevel,
@@ -4729,7 +4804,10 @@ class RacingGenesisApp {
     this.updateFPS();
 
     // 11. Render 3D Scene
-    this.renderer.render(this.scene, this.camera);
+    if (isChase) this.renderChasePose();
+    else this.renderer.render(this.scene, this.camera);
+    // Unfreeze after rendering so the last countdown frame consumes no race time.
+    this.updateResumeCountdown(dt);
   }
 }
 

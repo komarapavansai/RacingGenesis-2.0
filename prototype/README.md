@@ -1,94 +1,72 @@
-# Racing Genesis — Assignment 5: Beta Build & Advanced Feature Integration
+# Racing Genesis prototype
 
-**Course**: CS 549 (AI for Visual Computing) — Rutgers University  
-**Project**: Racing Genesis: Physics-Driven Procedural F1 Simulation & Autonomous AI Driving  
-**Build Version**: Beta Build v7.0 (Secondary Technical Pillars & Multi-Car Racing)  
-**Playable Prototype**: [http://localhost:8081](http://localhost:8081)  
-**GitHub Repository**: [https://github.com/VShaunak/RacingGenesis-2.0](https://github.com/VShaunak/RacingGenesis-2.0)  
+A static Three.js racing game with editable planar circuits, autonomous and manual driving, synthesized audio, and telemetry. Three.js r186 is bundled locally; no package installation or build step is required.
 
----
+## Run locally
 
-## 🏎️ Beta Build Overview: Secondary Pillar Integration & Visual Cohesion
+From the repository root:
 
-Following the Assignment 4 Alpha milestone, **Assignment 5 transitions our project into a fully cohesive Beta Build.** We expanded our vertical slice by directly connecting secondary technical pillars into the active driving loop, elevating visual fidelity from developer prototypes into an authentic Formula 1 simulator.
-
-### 🌟 Key Secondary Technical Pillars Integrated in Beta
-
-1. **Hardware-Instanced GPU Tire Smoke & Asphalt Skidmarks**:
-   - Single draw-call `THREE.InstancedMesh` managing a 120-particle pool with billboarded camera-facing soft alpha sprites.
-   - Dynamic particle emission from front and rear tire contact patches when threshold braking (`isBraking`) or lateral sliding occurs (`lateral slip > 2.2G`).
-   - Dynamic asphalt skidmark ribbon segments deposited on the road bed along tire trajectories, fading over time.
-
-2. **Brake Disc Thermal Incandescence (Molten Glow Shader)**:
-   - Dynamic thermal model accumulating kinetic friction heat up to 800°C under heavy braking (`brakeHeat = 1.0`).
-   - Modulates carbon-ceramic rotor material into glowing incandescent crimson/amber (`emissive: 0xff3300`, `emissiveIntensity: 2.8`).
-   - Realistic convective cooling airflow dissipating thermal load as vehicle speed climbs down straightaways.
-
-3. **Multi-Car AI Racing Agent (Sparring Opponent)**:
-   - Concurrent secondary Formula 1 car entity with distinctive Scarlet Red & Gold livery.
-   - Follows procedural track splines with dynamic lookahead pacing, lane offsets, and overtaking/defending behavior.
-   - Real-time time delta calculation displayed directly on the HUD (`P2 GAP: +1.45s`).
-
-4. **Curvilinear Boundary Collision & Curb Rumble Haptics**:
-   - High-frequency curb contact detection (`dist > roadHalf - 0.7m`) triggering chassis micro-vibrations and screen shake.
-   - Web Audio curb rumble synthesizer generating 48 Hz low-frequency square wave harmonics.
-   - Off-track grass/gravel trap drag penalties (`-34 m/s²`) and kicking dust particles.
-
-5. **Live Telemetry Waveform Oscillogram (90 Hz Canvas)**:
-   - Rolling 75-sample circular buffer rendering multi-channel live traces for Speed, Throttle %, Brake %, and Lateral G-Force in the HUD Telemetry drawer.
-
-6. **Atmospheric Environment & Visual Cohesion**:
-   - Atmospheric sky gradient texture blending warm horizon haze with alpine zenith blue.
-   - Dynamic grandstands, pine forest stands, and cheering trackside spectators automatically positioned relative to procedural track geometry.
-
----
-
-## 🎮 The Full Beta Game Loop
-
-```
-┌─────────────────────────┐
-│       START STATE       │ ➔ 5 Real Grand Prix Circuits (Monza, Silverstone, Spa, Monaco, Suzuka)
-│    (Pre-Race Config)    │ ➔ Custom Track Length Scaling: 1,000m to 10,000m
-└────────────┬────────────┘ ➔ Driving Mode: Autonomous AI vs. Manual WASD Control
-             │
-             ▼
-┌─────────────────────────┐
-│       ACTIVE STATE      │ ➔ Locked 90 FPS WebGL rendering with zero memory leaks
-│   (Beta Racing Loop)    │ ➔ Multi-Car Sparring Opponent & Live Gap Delta
-└────────────┬────────────┘ ➔ Tire Smoke, Skidmarks & Glowing Brake Rotors
-             │              ➔ Curb Rumble Audio & Haptic Feedback
-             │ [Laps Completed]
-             ▼
-┌─────────────────────────┐
-│        END STATE        │ ➔ Waving Checkered Flag & Trackside Podium Celebration
-│   (Session Summary)     │ ➔ Lap-by-Lap Timing Table, Top Speed, Max Lateral G
-└─────────────────────────┘ ➔ Instant "Race Again" & "Track Sculptor Sandbox" Actions
+```powershell
+cd prototype
+python serve.py 8081
 ```
 
----
+Open http://localhost:8081. The root repository index also redirects to `prototype/index.html` when served from the repository root.
 
-## 🚀 How to Run Locally
+## Controls
 
-1. Open PowerShell or Terminal in this directory:
-   ```powershell
-   cd "D:\My files\Rutgers\7-AI for Visual Computing\All assignments\Assignment-5\prototype"
-   python serve.py 8081
-   ```
-2. Open your web browser to:
-   👉 **[http://localhost:8081](http://localhost:8081)**
+| Action | Control |
+| --- | --- |
+| Accelerate | W / Up arrow |
+| Brake, then reverse | S / Down arrow |
+| Steer | A / D or Left / Right arrows |
+| Cycle Chase, Cockpit, Top/Orbit | C or header buttons |
+| Pause / resume | Escape; Pause and Resume buttons |
+| Toggle audio | M or Audio button |
+| Track Editor / Telemetry drawers | [ / ] |
+| Orbit camera | Drag to rotate and tilt; wheel to zoom; double-click the canvas to fit |
+| Edit track | Toggle 3D Edit Handles, then drag an anchor |
 
----
+The default 5.2 km Workshop circuit has a pit straight, hairpins, and esses. Top/Orbit opens in **Helicopter**, a stabilized tracking shot angled down toward the 3D car and the road ahead. **Full circuit** frames the track directly overhead and folds away the side drawers, which can be reopened. Scroll, pinch, or use **+** and **−** to zoom. Select **Fit track** or double-click the canvas to restore the overhead framing. Drag to change the angle. **Map** adds color-coded track guidance. Full circuit and Map refit when the track, drawers, or viewport change. During an anchor drag the camera stays still and refits on release.
 
-## 🕹️ Controls & Hotkeys Guide
+Road width, curvature, and surface friction apply with Rebuild Track. Track length commits when the numeric field loses focus or the slider drag finishes. Circuit changes reset the session; FX and driving-mode toggles preserve the circuit.
 
-| Action | Input | Description |
-| :--- | :--- | :--- |
-| **Accelerate** | `W` or `Up Arrow` | Applies progressive throttle (up to 228 mph) |
-| **Brake / Reverse** | `S` or `Down Arrow` | Threshold carbon braking down to halt; reverse gear |
-| **Steer Left / Right** | `A` / `D` or `Left` / `Right` | Progressive Ackermann steering with centering inertia |
-| **Switch Camera** | `C` or Top Bar | Cycle between 3rd-Person Chase, Cockpit 3D, and Orbit |
-| **Toggle Track Editor** | `[` | Slide open / close left Track Editor drawer |
-| **Toggle Telemetry** | `]` | Slide open / close right Live Telemetry drawer |
-| **Engine Audio** | Top Icon | Toggle real-time procedural Web Audio V6 engine sound |
-| **AI Opponent Car** | Left Drawer Toggle | Turn secondary sparring car on or off |
-| **Smoke & Skidmarks**| Left Drawer Toggle | Toggle particle smoke and tire skidmark decals |
+## Runtime structure
+
+`app.js` contains the application classes; `index.html` supplies the controls and `style.css` supplies the overlay layout.
+
+- `Track3D`: closed centripetal Catmull-Rom spline, sampled planar frames, road/scenery meshes, nearest-segment progress, and editable anchors.
+- `HeuristicNPCDriver`: smoothed per-lap path offsets, best-lap records, and a curvature-based speed profile. A backward braking pass plans deceleration before corners.
+- `RacingGenesisApp`: input, race states, 120 Hz fixed simulation steps, HUD updates, and rendering.
+- `RaceCar3D`: procedural vehicle geometry, wheel animation, brake glow, and a canvas-textured cockpit display.
+- `CameraManager3D`: Chase, Cockpit, Helicopter, Full circuit, and Map framing.
+- `TireSmokeAndSkidSystem`: 120 pooled smoke instances and 90 skidmark segments.
+- `RacingEngineSound`: Web Audio oscillators controlled by RPM, braking, throttle, and curb contact.
+- `LiveTelemetryGraph`: a 75-sample rolling history recorded on active rendered frames.
+
+Resume shows a three-second countdown while the race stays frozen. When it ends, the previous phase continues with the same speed, position, and lap time. The final lap is recorded once, motion stops, and a frame-driven 4.5-second celebration precedes results. Reset cancels pending countdowns and clears session effects. Losing window focus pauses and releases held driving keys.
+
+Track, scenery, and handle rebuilds dispose nested geometry, materials, and textures, deduplicating shared resources within each owned group.
+
+## Verification
+
+From either the repository root or the prototype directory:
+
+```powershell
+node prototype/test_beta_simulation.mjs
+node prototype/scratch_test.mjs
+```
+
+When already in `prototype`, omit the `prototype/` prefix.
+
+The regression suite uses real Three.js geometry and math with mocked DOM, Canvas, audio, and animation scheduling. It asserts countdown, pause/resume, completion/reset, independent UI buttons, manual boundaries and reverse, brake effects, mode switching, fixed-step timing, all six preset laps, low/high-grip stress tracks, camera projection after edits/resizing, overview fog, and recursive resource disposal. Failures produce a nonzero exit status. The smoke test asserts that application initialization actually succeeded.
+
+The headless environment deliberately has no WebGL context; renderer-context warnings are expected there. These tests do not measure GPU frame rate, image quality, or audible output. For browser checks, exercise Top/Orbit, change circuits and lengths, drag/zoom/refit, drive through a countdown, pause/resume, toggle FX, and finish a one-lap session.
+
+## Model and performance limits
+
+The AI is a kinematic spline follower with a speed envelope, including a local speed cap to respect planned grip. It does not simulate physical tire slip. Manual driving uses heading and velocity integration with lateral-distance curb/off-track checks; scenery and cars have no rigid-body collision solver.
+
+Per-lap strategies remain predetermined heuristics. Best-lap storage does not train a model or optimize future strategies. Named circuit point sets are approximations, and the track is planar. Brake heat is a normalized visual effect, not a temperature or kinetic-energy calculation. The live delta estimates pace against the best lap.
+
+Rendering follows the display refresh, subject to hardware and scene complexity. Physics runs at fixed 120 Hz simulation steps. Telemetry is sampled per active render frame. Nested-resource disposal is covered by tests. Historical assignment reports describe the submitted beta and contain stronger claims than this implementation supports.
